@@ -192,6 +192,9 @@ class FinalLayer(nn.Module):
         hidden_dim: int = None,
         ln: bool = True,
     ):
+        if hidden_dim is None:
+            hidden_dim = channel_dim
+
         super().__init__()
         self.ln = nn.LayerNorm(channel_dim) if ln else nn.Identity()
         self.mlp = ResidualMLP(
