@@ -17,6 +17,8 @@ We also release a new additive manufacturing dataset to spur further research.
 Our code is available at
 [https://github.com/vpuri3/FLARE.py](https://github.com/vpuri3/FLARE.py).
 
+Please note that this repository is a cleaned-up version of the internal research repository we use. In case you encounter any problems with it, please don't hesitate to contact me.
+
 ## Highlights
 
 - **Linear complexity token mixing.** FLARE is an efficient self-attention mechanism designed to learn on long sequences such as point clouds.
