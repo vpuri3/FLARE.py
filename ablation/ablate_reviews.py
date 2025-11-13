@@ -244,7 +244,7 @@ def plot_lb(df: pd.DataFrame):
     ax.set_yticklabels([str(lb) for lb in num_latent_blocks_list], fontsize=fontsize)
 
     ax.set_xlabel(r'Number of blocks ($B$)', fontsize=fontsize)
-    ax.set_ylabel(r'Number of latent blocks ($L$)', fontsize=fontsize)
+    ax.set_ylabel(r'Number of latent blocks ($L_B$)', fontsize=fontsize)
 
     # Compute vmin and vmax for LogNorm (used in imshow)
     vmin = np.nanmin(heatmap_array[~np.isnan(heatmap_array)])
