@@ -258,6 +258,12 @@ class Trainer:
         self.train_loss_fullbatch = []
         self.test_loss_fullbatch  = []
         
+        self.time_per_epoch = []
+        self.time_per_step = []
+        self.memory_utilization = []
+        self.grad_norm_per_step = []
+        self.learning_rate_per_step = []
+
         ###
         # Callbacks
         ###
@@ -405,13 +411,6 @@ class Trainer:
         
         self.is_training = True
         self.make_dataloader()
-
-        # training stats
-        self.time_per_epoch = []
-        self.time_per_step = []
-        self.memory_utilization = []
-        self.grad_norm_per_step = []
-        self.learning_rate_per_step = []
 
         self.trigger_callbacks("epoch_start")
         self.statistics()

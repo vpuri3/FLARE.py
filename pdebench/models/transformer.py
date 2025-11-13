@@ -58,7 +58,7 @@ class MultiHeadedSelfAttention(nn.Module):
 
         self.qkv_proj = nn.Linear(self.channel_dim, 3 * self.channel_dim, bias=False)
         self.out_proj = nn.Linear(self.channel_dim, self.channel_dim)
-        
+
     def forward(self, x):
 
         # x: [B N C]

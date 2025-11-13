@@ -309,37 +309,53 @@ class ScoresCallback(mlutils.Callback):
             "text.latex.preamble": r"\usepackage{amsmath}"
         })
 
-        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 6))
+        # Determine number of axes and which blocks to plot
+        if num_blocks == 1:
+            n_axes = 1
+            blocks_to_plot = [0]
+        elif num_blocks == 2:
+            n_axes = 2
+            blocks_to_plot = [0, 1]
+        else:  # num_blocks >= 3
+            n_axes = 3
+            blocks_to_plot = [0, num_blocks // 2, num_blocks - 1]
+        
+        fig, axes = plt.subplots(1, n_axes, figsize=(n_axes * 5.33, 6))
+        if n_axes == 1:
+            axes = [axes]  # Make it a list for consistent iteration
+        else:
+            axes = list(axes)
+        
         fontsize = 28
         
-        for ax in [ax1, ax2, ax3]:
+        for ax in axes:
             ax.set_xscale('linear')
             ax.set_yscale('log', base=10)
             ax.grid(True, which="both", ls="-", alpha=0.5)
             ax.set_ylim(1e-8, 2e-0)
             ax.set_yticks([1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e-0])
 
-        ax1.set_yticklabels(['1e-8', '1e-7', '1e-6', '1e-5', '1e-4', '1e-3', '1e-2', '1e-1', '1e-0'])
-        ax2.set_yticklabels(['', '', '', '', '', '', '', '', ''])
-        ax3.set_yticklabels(['', '', '', '', '', '', '', '', ''])
+        # Set y-axis labels only on the first axis
+        axes[0].set_yticklabels(['1e-8', '1e-7', '1e-6', '1e-5', '1e-4', '1e-3', '1e-2', '1e-1', '1e-0'])
+        for ax in axes[1:]:
+            ax.set_yticklabels(['', '', '', '', '', '', '', '', ''])
 
-        for ax in [ax1, ax2, ax3]:
+        for ax in axes:
             ax.tick_params(axis='both', which='major', labelsize=fontsize)
 
-        ax1.set_ylabel(r'Eigenvalue magnitude', fontsize=fontsize)
-        ax1.set_xlabel(r'Eigenvalue Index', fontsize=fontsize)
-        ax2.set_xlabel(r'Eigenvalue Index', fontsize=fontsize)
-        ax3.set_xlabel(r'Eigenvalue Index', fontsize=fontsize)
+        axes[0].set_ylabel(r'Eigenvalue magnitude', fontsize=fontsize)
+        for ax in axes:
+            ax.set_xlabel(r'Eigenvalue Index', fontsize=fontsize)
 
-        ax1.set_title(r'Block 1', fontsize=fontsize)
-        ax2.set_title(r'Block 5', fontsize=fontsize)
-        ax3.set_title(r'Block 8', fontsize=fontsize)
-        
+        # Set titles based on actual block numbers
+        for i, block_idx in enumerate(blocks_to_plot):
+            axes[i].set_title(r'Block %d' % (block_idx + 1), fontsize=fontsize)
+
         linewidth = 2.5
 
-        for block, ax in zip([0, 4, 7], [ax1, ax2, ax3]):
+        for block_idx, ax in zip(blocks_to_plot, axes):
             for h in range(num_heads):
-                ax.plot(eigenvals_means[block][h, :cutoff], linewidth=linewidth)
+                ax.plot(eigenvals_means[block_idx][h, :cutoff], linewidth=linewidth)
 
             ax.axvline(x=num_latents-1, color='red', linestyle='--', linewidth=linewidth, label=r'Number of latents = %d' % num_latents)
             ax.axhline(y=torch.finfo(torch.float32).eps, color='black', linestyle='--', linewidth=linewidth, label=r'Float32 Precision')

@@ -526,6 +526,52 @@ def main(cfg, device):
                 num_latents=num_latents,
                 act=act,
             )
+        elif cfg.model_type == 7:
+
+            #--------------------------------#
+            # BigFLARE (ablations)
+            #--------------------------------#
+
+            if GLOBAL_RANK == 0:
+                print(
+                    f"Using FLAREModel(c_in={c_in}, c_out={c_out}) with\n"
+                    + f"\tchannel_dim={cfg.channel_dim}\n"
+                    + f"\tnum_blocks={cfg.num_blocks}\n"
+                    + f"\tnum_latents={cfg.num_latents}\n"
+                    + f"\tnum_heads={cfg.num_heads}\n"
+                    + f"\tact={cfg.act}\n"
+                    + f"\tnum_layers_kv_proj={cfg.num_layers_kv_proj}\n"
+                    + f"\tnum_layers_mlp={cfg.num_layers_mlp}\n"
+                    + f"\tnum_layers_in_out_proj={cfg.num_layers_in_out_proj}\n"
+                    + f"\tmlp_ratio={cfg.mlp_ratio}\n"
+                    + f"\tkv_proj_ratio={cfg.kv_proj_ratio}\n"
+                    + f"\tin_out_proj_ratio={cfg.in_out_proj_ratio}\n"
+                    + f"\tout_proj_ln={cfg.out_proj_ln}\n"
+                    # ablations
+                    + f"\tshared_latents={cfg.shared_latents}\n"
+                    + f"\tnum_latent_blocks={cfg.num_latent_blocks}\n"
+                )
+
+            from pdebench.models.flare_ablations import BigFLAREModel
+            model = BigFLAREModel(
+                in_dim=c_in,
+                out_dim=c_out,
+                channel_dim=cfg.channel_dim,
+                num_blocks=cfg.num_blocks,
+                num_latents=cfg.num_latents,
+                num_heads=cfg.num_heads,
+                act=cfg.act,
+                num_layers_kv_proj=cfg.num_layers_kv_proj,
+                num_layers_mlp=cfg.num_layers_mlp,
+                num_layers_in_out_proj=cfg.num_layers_in_out_proj,
+                mlp_ratio=cfg.mlp_ratio,
+                kv_proj_ratio=cfg.kv_proj_ratio,
+                in_out_proj_ratio=cfg.in_out_proj_ratio,
+                out_proj_ln=cfg.out_proj_ln,
+                # ablations
+                shared_latents=cfg.shared_latents,
+                num_latent_blocks=cfg.num_latent_blocks,
+            )
         else:
             #--------------------------------#
             # No model selected
@@ -563,7 +609,7 @@ def main(cfg, device):
         callback = am.TimeseriesCallback(case_dir, mesh=mesh, num_eval_cases=20, autoreg_start=1)
 
     # use scores callback in eval mode
-    if cfg.model_type in [2,] and cfg.evaluate and cfg.dataset in [
+    if cfg.model_type in [2,7] and cfg.evaluate and cfg.dataset in [
         'elasticity', 'darcy', 'airfoil_steady', 'shapenet_car', 'airfrans',
     ]:
         callback = pdebench.ScoresCallback(case_dir)
@@ -710,10 +756,10 @@ def main(cfg, device):
     #-------------#
     # load snapshot
     #-------------#
-    
+
     if cfg.restart:
         callback.load(trainer)
-    
+
     #=================#
     # TRAIN
     #=================#
@@ -755,7 +801,7 @@ class Config:
     For restarting from checkpoint, run
 
         python -m pdebench --restart true --exp_name <exp_name>
-        
+
     and training will resume from the latest checkpoint in out/pdebench/<exp_name>/ckptXX.
     '''
 
@@ -815,6 +861,9 @@ class Config:
     in_out_proj_ratio: float = 1.0
     #
     out_proj_ln: bool = True
+    # ablations
+    shared_latents: bool = False
+    num_latent_blocks: int = 0
 
 #======================================================================#
 if __name__ == "__main__":
