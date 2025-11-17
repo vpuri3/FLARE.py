@@ -10,7 +10,7 @@ __all__ = [
 ]
 
 # local
-from .transformer import SelfAttentionBlock
+from .transformer import SelfAttentionBlock, MLPBlock
 from .flare import ResidualMLP, FinalLayer
 
 #======================================================================#
@@ -72,7 +72,7 @@ class PerceiverDecoder(nn.Module):
         #   y: [B N C]
         # Returns:
         #   z: [B N C]
-        
+
         x = self.ln1(x)
         y = self.ln2(y)
 
@@ -100,6 +100,7 @@ class PerceiverIO(nn.Module):
         num_latents: int = 128,
         mlp_ratio: float = 4.0,
         act: str = None,
+        cross_attn: bool = False,
     ):
         super().__init__()
 
@@ -117,9 +118,12 @@ class PerceiverIO(nn.Module):
             num_heads=num_heads,
             num_latents=num_latents,
         )
+        
+        self.cross_attn = cross_attn
+        AttnBlock = CrossAttentionBlock if cross_attn else SelfAttentionBlock
 
         self.blocks = nn.ModuleList([
-            SelfAttentionBlock(
+            AttnBlock(
                 channel_dim=channel_dim,
                 num_heads=num_heads,
                 act=act,
@@ -161,12 +165,75 @@ class PerceiverIO(nn.Module):
         z = self.encoder(x) # [B M C]
 
         for block in self.blocks:
-            z = block(z) # [B M C]
+            if self.cross_attn:
+                z = block(z, x) # [B M C] <- [B M C], [B N C]
+            else:
+                z = block(z) # [B M C] <- [B M C]
 
         x = self.decoder(z, x) # [B M C], [B, N, C] -> [B N C]
         x = self.out_proj(x) # [B N C]
 
         return x
+
+#======================================================================#
+# Cross Attention Block
+#======================================================================#
+class MultiHeadedCrossAttention(nn.Module):
+    def __init__(self, channel_dim: int, num_heads: int = None):
+        super().__init__()
+
+        self.channel_dim = channel_dim
+        self.num_heads = channel_dim // 16 if num_heads is None else num_heads
+        self.head_dim = self.channel_dim // self.num_heads 
+        self.scale = self.head_dim ** -0.5
+
+        assert self.channel_dim % self.num_heads == 0, f"channel_dim must be divisible by num_heads. Got {self.channel_dim} and {self.num_heads}."
+
+        self.q_proj = nn.Linear(self.channel_dim, self.channel_dim, bias=False)
+        self.kv_proj = nn.Linear(self.channel_dim, 2 * self.channel_dim, bias=False)
+        self.out_proj = nn.Linear(self.channel_dim, self.channel_dim)
+
+    def forward(self, z, x):
+
+        # z <- x
+        # z: [B M C]
+        # x: [B N C]
+
+        q = self.q_proj(z) # [B M C]
+        k, v = self.kv_proj(x).chunk(2, dim=-1) # [B N C]
+        q, k, v = [rearrange(z, 'b n (h d) -> b h n d', h=self.num_heads) for z in [q, k, v]]
+
+        y = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
+
+        y = rearrange(y, 'b h n d -> b n (h d)')
+        y = self.out_proj(y)
+
+        return y
+
+class CrossAttentionBlock(nn.Module):
+    def __init__(
+            self,
+            channel_dim: int,
+            num_heads: int = None,
+            mlp_ratio: float = 4.0,
+            act: str = None,
+        ):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(channel_dim)
+        self.ln2 = nn.LayerNorm(channel_dim)
+        self.ln3 = nn.LayerNorm(channel_dim)
+        self.att = MultiHeadedCrossAttention(channel_dim, num_heads)
+        self.mlp = MLPBlock( in_dim=channel_dim, hidden_dim=int(channel_dim * mlp_ratio), out_dim=channel_dim, act=act)
+
+    def forward(self, z, x):
+        # z <- x
+        # z: [B, M, C]
+        # x: [B, N, C]
+
+        z = z + self.att(self.ln1(z), self.ln2(x))
+        z = z + self.mlp(self.ln3(z))
+
+        return z
 
 #======================================================================#
 #

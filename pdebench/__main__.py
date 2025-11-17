@@ -481,7 +481,7 @@ def main(cfg, device):
                 cfg.batch_size = 1
             else:
                 raise ValueError(f"Batch size not set for dataset {cfg.dataset}")
-            cfg.learning_rate = 1e-3
+            cfg.learning_rate = 5e-4 if cfg.dataset not in ['elasticity', 'drivaerml_40k'] else 2e-4
             cfg.opt_beta1 = 0.9
             cfg.opt_beta2 = 0.999
             cfg.schedule = 'OneCycleLR'
@@ -503,7 +503,9 @@ def main(cfg, device):
             num_heads = channel_dim // 16
             mlp_ratio = 4.0
             act = None
-            num_latents = 1024
+            num_latents = 512
+
+            cross_attn = cfg.pcvr_cross_attn
 
             if GLOBAL_RANK == 0:
                 print(
@@ -514,6 +516,7 @@ def main(cfg, device):
                     + f"\tmlp_ratio={mlp_ratio}\n"
                     + f"\tnum_latents={num_latents}\n"
                     + f"\tact={act}\n"
+                    + f"\tcross_attn={cross_attn}\n"
                 )
 
             model = pdebench.PerceiverIO(
@@ -525,6 +528,7 @@ def main(cfg, device):
                 mlp_ratio=mlp_ratio,
                 num_latents=num_latents,
                 act=act,
+                cross_attn=cross_attn,
             )
         elif cfg.model_type == 7:
 
@@ -843,6 +847,8 @@ class Config:
     # Transolver
     conv2d: bool = False
     unified_pos: bool = False
+    # PerceiverIO
+    pcvr_cross_attn: bool = True
     ###
     # FLARE
     ###
