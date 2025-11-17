@@ -45,6 +45,7 @@ echo "Installing core packages from PyPI..."
 uv add torch-geometric timm datasets
 uv add tqdm jsonargparse einops setuptools packaging
 uv add scipy pandas seaborn pyvista matplotlib
+# uv add causal_conv1d mamba_ssm
 
 # Interactive tools
 echo "Installing interactive tools..."
