@@ -576,6 +576,68 @@ def main(cfg, device):
                 shared_latents=cfg.shared_latents,
                 num_latent_blocks=cfg.num_latent_blocks,
             )
+        elif cfg.model_type == 8:
+
+            #--------------------------------#
+            # LaMO
+            #--------------------------------#
+
+            cfg.epochs = 250 if cfg.dataset in ['shapenet_car', 'lpbf'] else 500
+            if cfg.dataset in ['elasticity', 'shapenet_car', 'lpbf'] or cfg.dataset.startswith('drivaerml'):
+                cfg.batch_size = 1
+            elif cfg.dataset in ['airfoil_steady', 'pipe', 'darcy', 'airfoil_dynamic', 'cylinder_flow']:
+                cfg.batch_size = 4
+            else:
+                raise ValueError(f"Batch size not set for dataset {cfg.dataset}")
+            cfg.learning_rate = 1e-3
+            cfg.opt_beta1 = 0.9
+            cfg.opt_beta2 = 0.999
+            cfg.schedule = 'OneCycleLR'
+            cfg.one_cycle_pct_start = 0.3
+            cfg.one_cycle_div_factor = 25
+            cfg.one_cycle_final_div_factor = 1e4
+            cfg.clip_grad_norm = 0.1
+            if cfg.dataset in ['shapenet_car']:
+                cfg.weight_decay = 5e-2
+            elif cfg.dataset in ['drivaerml_40k']:
+                cfg.weight_decay = 1e-4
+            elif cfg.dataset in ['lpbf']:
+                cfg.weight_decay = 1e-4
+            else:
+                cfg.weight_decay = 1e-5
+
+            n_layers = 8
+            n_hidden = 128 if cfg.dataset not in ['airfrans', 'shapenet_car', 'navier_stokes'] else 256
+            slice_num = 64 if cfg.dataset not in ['airfrans', 'shapenet_car', 'navier_stokes'] else 32
+            n_head = 8
+            mlp_ratio = 1.0
+
+            if GLOBAL_RANK == 0:
+
+                print(f"Using LaMO(c_in={c_in}, c_out={c_out}) with\n"
+                    + f"\tn_layers={n_layers}\n"
+                    + f"\tn_hidden={n_hidden}\n"
+                    + f"\tslice_num={slice_num}\n"
+                    + f"\tn_head={n_head}\n"
+                    + f"\tmlp_ratio={mlp_ratio}\n"
+                    + f"\tconv2d={cfg.conv2d}\n"
+                    + f"\tunified_pos={cfg.unified_pos}\n"
+                )
+
+            if cfg.conv2d:
+                model = pdebench.LaMO_Structured_Mesh_2D(
+                    space_dim=c_in, out_dim=c_out, fun_dim=0,
+                    n_hidden=n_hidden, n_layers=n_layers,
+                    n_head=n_head, mlp_ratio=mlp_ratio, slice_num=slice_num,
+                    H=metadata['H'], W=metadata['W'],
+                    unified_pos=cfg.unified_pos,
+                )
+            else:
+                model = pdebench.LaMO(
+                    space_dim=c_in, out_dim=c_out, fun_dim=0,
+                    n_hidden=n_hidden, n_layers=n_layers,
+                    n_head=n_head, mlp_ratio=mlp_ratio, slice_num=slice_num,
+                )
         else:
             #--------------------------------#
             # No model selected

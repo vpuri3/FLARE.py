@@ -6,4 +6,5 @@ from .transformer import *
 from .gnot import *
 from .upt import *
 from .perceiver import *
+from .lamo import *
 #
