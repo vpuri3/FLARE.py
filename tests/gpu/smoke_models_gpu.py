@@ -106,7 +106,6 @@ def main() -> int:
 
     from pdebench.models.flare_ablations import BigFLAREModel
     from pdebench.models.flare_experimental import FLAREExperimentalModel
-    from pdebench.models.lamo import LaMO, LaMO_Structured_Mesh_2D
     from pdebench.models.loopy import LoopyWrapper
     from pdebench.models.sparse_transformer import TS1Uncond
     from pdebench.models.transolver import Transolver, Transolver_Structured_Mesh_2D
@@ -114,6 +113,11 @@ def main() -> int:
     from pdebench.models.ts3_uncond import TS3Uncond
     from pdebench.models.unloopy import UnloopyWrapper
     from pdebench.models.upt import UPT
+    try:
+        from pdebench.models.lamo import LaMO, LaMO_Structured_Mesh_2D
+        has_lamo = True
+    except ModuleNotFoundError:
+        has_lamo = False
 
     cases: list[Case] = [
         # pdebench wrappers/models
@@ -322,35 +326,6 @@ def main() -> int:
             lambda d: ((torch.randn(2, 64, 4, device=d),), {}),
         ),
         Case(
-            "pdebench.LaMO",
-            lambda: LaMO(
-                space_dim=2,
-                fun_dim=0,
-                out_dim=3,
-                n_layers=2,
-                n_hidden=128,
-                n_head=4,
-                slice_num=8,
-            ),
-            lambda d: ((torch.randn(2, 64, 2, device=d),), {}),
-        ),
-        Case(
-            "pdebench.LaMO_Structured_Mesh_2D",
-            lambda: LaMO_Structured_Mesh_2D(
-                space_dim=2,
-                fun_dim=0,
-                out_dim=3,
-                n_layers=2,
-                n_hidden=32,
-                n_head=4,
-                slice_num=8,
-                H=8,
-                W=8,
-                unified_pos=False,
-            ),
-            lambda d: ((torch.randn(2, 64, 2, device=d),), {}),
-        ),
-        Case(
             "pdebench.UPT",
             lambda: UPT(
                 space_dim=2,
@@ -400,6 +375,43 @@ def main() -> int:
             lambda d: ((torch.randint(0, 128, (2, 64), device=d),), {}),
         ),
     ]
+
+    if has_lamo:
+        cases.extend(
+            [
+                Case(
+                    "pdebench.LaMO",
+                    lambda: LaMO(
+                        space_dim=2,
+                        fun_dim=0,
+                        out_dim=3,
+                        n_layers=2,
+                        n_hidden=128,
+                        n_head=4,
+                        slice_num=8,
+                    ),
+                    lambda d: ((torch.randn(2, 64, 2, device=d),), {}),
+                ),
+                Case(
+                    "pdebench.LaMO_Structured_Mesh_2D",
+                    lambda: LaMO_Structured_Mesh_2D(
+                        space_dim=2,
+                        fun_dim=0,
+                        out_dim=3,
+                        n_layers=2,
+                        n_hidden=32,
+                        n_head=4,
+                        slice_num=8,
+                        H=8,
+                        W=8,
+                        unified_pos=False,
+                    ),
+                    lambda d: ((torch.randn(2, 64, 2, device=d),), {}),
+                ),
+            ]
+        )
+    else:
+        print("Skipping LaMO GPU smoke cases: optional mamba_ssm dependencies unavailable.")
 
     # lra backend sweep via ModelWrapper
     backend_kwargs = {
