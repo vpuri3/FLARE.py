@@ -25,7 +25,11 @@ os.makedirs(CASEDIR, exist_ok=True)
 
 #======================================================================#
 def collect_data(dataset: str):
-    data_dir = os.path.join(CASEDIR, f'abl_num_layers_{dataset}')
+    # Check both possible locations for backward compatibility
+    data_dir = os.path.join(CASEDIR, 'abl', f'abl_num_layers_{dataset}')
+    if not os.path.exists(data_dir):
+        # Fallback to old location
+        data_dir = os.path.join(CASEDIR, f'abl_num_layers_{dataset}')
 
     # Initialize empty dataframe
     df = pd.DataFrame()
@@ -67,7 +71,7 @@ def collect_data(dataset: str):
                     'num_blocks': config.get('num_blocks'),
                     'num_heads': config.get('num_heads'),
                     'num_layers_kv_proj': config.get('num_layers_kv_proj'),
-                    'num_layers_mlp': config.get('num_layers_mlp'),
+                    'num_layers_ffn': config.get('num_layers_ffn'),
                     'num_layers_in_out_proj': config.get('num_layers_in_out_proj'),
                     'seed': config.get('seed'),
                 })
@@ -91,15 +95,31 @@ def collect_data(dataset: str):
 def plot_results(dataset: str, df: pd.DataFrame):
 
     #---------------------------------------------------------#
-    df = df.groupby(['num_latents', 'num_layers_mlp', 'num_layers_kv_proj']).mean().reset_index()
+    # Validate DataFrame has required columns
+    required_columns = ['num_latents', 'num_layers_ffn', 'num_layers_kv_proj', 'test_rel_error']
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    
+    if len(df) == 0:
+        print(f"ERROR: No data collected for dataset '{dataset}'. Cannot plot results.")
+        print(f"Checked data directories:")
+        print(f"  1. {os.path.join(CASEDIR, 'abl', f'abl_num_layers_{dataset}')}")
+        print(f"  2. {os.path.join(CASEDIR, f'abl_num_layers_{dataset}')}")
+        return
+    
+    if missing_columns:
+        print(f"ERROR: DataFrame is missing required columns: {missing_columns}")
+        print(f"Available columns: {df.columns.tolist()}")
+        return
+    
+    df = df.groupby(['num_latents', 'num_layers_ffn', 'num_layers_kv_proj']).mean().reset_index()
 
     configs = df[['num_latents',]].drop_duplicates()
-    print(f"Found {len(configs)} unique configurations for num_layers_mlp, num_layers_kv_proj lineplot.")
+    print(f"Found {len(configs)} unique configurations for num_layers_ffn, num_layers_kv_proj lineplot.")
     
     num_latents_list = configs['num_latents'].unique().tolist()
 
     #---------------------------------------------------------#
-    # LINEPLOT of test error vs num_layers_mlp, num_layers_kv_proj
+    # LINEPLOT of test error vs num_layers_ffn, num_layers_kv_proj
     #---------------------------------------------------------
 
     plt.rcParams.update({
@@ -109,8 +129,8 @@ def plot_results(dataset: str, df: pd.DataFrame):
         "text.latex.preamble": r"\usepackage{amsmath}"
     })
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-    fontsize = 28
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5))
+    fontsize = 20
 
     ax1.set_ylabel(r'Test relative error', fontsize=fontsize)
 
@@ -142,7 +162,7 @@ def plot_results(dataset: str, df: pd.DataFrame):
         label = r'M=%s' % num_latents
 
         df_ = df[df['num_latents'] == num_latents]
-        df1 = df_[df_['num_layers_mlp'] == 3]
+        df1 = df_[df_['num_layers_ffn'] == 3]
         df2 = df_[df_['num_layers_kv_proj'] == 3]
         
         kwargs = {
@@ -151,7 +171,7 @@ def plot_results(dataset: str, df: pd.DataFrame):
         }
 
         ax1.plot(df1['num_layers_kv_proj'], df1['test_rel_error'], label=label, **kwargs)
-        ax2.plot(df2['num_layers_mlp'], df2['test_rel_error'], label=None, **kwargs)
+        ax2.plot(df2['num_layers_ffn'], df2['test_rel_error'], label=None, **kwargs)
 
     #---------------------------------------------------------#
     # Place legend below the subplots with wider line representations
@@ -192,10 +212,10 @@ def do_training(dataset: str, gpu_count: int = None, max_jobs_per_gpu: int = 2, 
     job_queue = []
     for seed in range(1):
         for num_latents in [16, 32, 64, 128]:
-            for num_layers_mlp in range(6):
-                add_job_to_queue(job_queue, dataset, num_latents=num_latents, num_layers_mlp=num_layers_mlp, num_layers_kv_proj=3, seed=seed, epochs=epochs, batch_size=batch_size, weight_decay=weight_decay)
+            for num_layers_ffn in range(6):
+                add_job_to_queue(job_queue, dataset, num_latents=num_latents, num_layers_ffn=num_layers_ffn, num_layers_kv_proj=3, seed=seed, epochs=epochs, batch_size=batch_size, weight_decay=weight_decay)
             for num_layers_kv_proj in range(6):
-                add_job_to_queue(job_queue, dataset, num_latents=num_latents, num_layers_mlp=3, num_layers_kv_proj=num_layers_kv_proj, seed=seed, epochs=epochs, batch_size=batch_size, weight_decay=weight_decay)
+                add_job_to_queue(job_queue, dataset, num_latents=num_latents, num_layers_ffn=3, num_layers_kv_proj=num_layers_kv_proj, seed=seed, epochs=epochs, batch_size=batch_size, weight_decay=weight_decay)
 
     utils.run_jobs(job_queue, gpu_count, max_jobs_per_gpu, reverse_queue,
                    dataset=dataset, epochs=epochs, batch_size=batch_size, weight_decay=weight_decay)
@@ -204,13 +224,17 @@ def do_training(dataset: str, gpu_count: int = None, max_jobs_per_gpu: int = 2, 
 
 #======================================================================#
 def add_job_to_queue(
-    job_queue: list, dataset: str, num_latents: int, num_layers_mlp: int, num_layers_kv_proj: int, seed: int,
+    job_queue: list, dataset: str, num_latents: int, num_layers_ffn: int, num_layers_kv_proj: int, seed: int,
     epochs: int = 500, batch_size: int = 2, weight_decay: float = 1e-5):
 
-    exp_name = f'abl_num_layers_{dataset}_M_{str(num_latents)}_LMLP_{str(num_layers_mlp)}_LKV_{str(num_layers_kv_proj)}_seed_{str(seed)}'
-    exp_name = os.path.join(f'abl_num_layers_{dataset}', exp_name)
+    exp_name = f'abl_num_layers_{dataset}_M_{str(num_latents)}_LMLP_{str(num_layers_ffn)}_LKV_{str(num_layers_kv_proj)}_seed_{str(seed)}'
+    exp_name_base = os.path.join(f'abl_num_layers_{dataset}', exp_name)
 
-    case_dir = os.path.join(CASEDIR, exp_name)
+    # Check both possible locations
+    case_dir = os.path.join(CASEDIR, 'abl', exp_name_base)
+    if not os.path.exists(case_dir):
+        case_dir = os.path.join(CASEDIR, exp_name_base)
+    
     if os.path.exists(case_dir):
         if os.path.exists(os.path.join(case_dir, 'ckpt10', 'rel_error.json')):
             print(f"Experiment {exp_name} exists. Skipping.")
@@ -221,7 +245,7 @@ def add_job_to_queue(
 
     job_queue.append({
         #
-        'exp_name': exp_name,
+        'exp_name': exp_name_base,
         'dataset': dataset,
         'seed': seed,
         #
@@ -230,14 +254,14 @@ def add_job_to_queue(
         'weight_decay': weight_decay,
         'mixed_precision': False,
         #
-        'model_type': 2,
+        'model_type': 'flare_ablations',
         #
         'num_blocks': 8,
         'channel_dim': 64,
         'num_heads': 8,
         'num_latents': num_latents,
         'num_layers_kv_proj': num_layers_kv_proj,
-        'num_layers_mlp': num_layers_mlp,
+        'num_layers_ffn': num_layers_ffn,
         'num_layers_in_out_proj': 2,
     })
 
@@ -246,15 +270,25 @@ def add_job_to_queue(
 #======================================================================#
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Latent Cross Attention model ablation study')
+    
+    def str_to_bool(v):
+        if isinstance(v, bool):
+            return v
+        if v.lower() in ('yes', 'true', 't', 'y', '1'):
+            return True
+        elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+            return False
+        else:
+            raise argparse.ArgumentTypeError('Boolean value expected.')
 
-    parser.add_argument('--eval', type=bool, default=False, help='Evaluate ablation study results')
-    parser.add_argument('--train', type=bool, default=False, help='Train ablation study')
-    parser.add_argument('--clean', type=bool, default=False, help='Clean ablation study results')
+    parser.add_argument('--eval', type=str_to_bool, default=False, help='Evaluate ablation study results')
+    parser.add_argument('--train', type=str_to_bool, default=False, help='Train ablation study')
+    parser.add_argument('--clean', type=str_to_bool, default=False, help='Clean ablation study results')
 
     parser.add_argument('--dataset', type=str, default='elasticity', help='Dataset to use')
     parser.add_argument('--gpu-count', type=int, default=None, help='Number of GPUs to use')
     parser.add_argument('--max-jobs-per-gpu', type=int, default=2, help='Maximum number of jobs per GPU')
-    parser.add_argument('--reverse-queue', type=bool, default=False, help='Reverse queue')
+    parser.add_argument('--reverse-queue', type=str_to_bool, default=False, help='Reverse queue')
 
     args = parser.parse_args()
 

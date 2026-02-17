@@ -7,6 +7,7 @@ import torch.nn.functional as F
 __all__ = [
     'make_optimizer_adamw',
     'make_optimizer_lion',
+    'make_optimizer_muon',
     #
     'darcy_deriv_loss',
     #
@@ -19,50 +20,258 @@ __all__ = [
 ]
 
 #======================================================================#
-def split_params(model):
-    decay = []
-    no_decay = []
+NO_DECAY_TYPES = (
+    nn.Embedding,
+    nn.LayerNorm,
+    nn.RMSNorm,
+    nn.BatchNorm1d,
+    nn.BatchNorm2d,
+    nn.BatchNorm3d,
+    nn.GroupNorm,
+    nn.InstanceNorm1d,
+    nn.InstanceNorm2d,
+    nn.InstanceNorm3d,
+)
+
+LATENT_TYPES = (
+    nn.Parameter,
+)
+
+def _collect_param_ids_by_module_types(model, types):
+    ids = set()
+    for module in model.modules():
+        if isinstance(module, types):
+            for p in module.parameters(recurse=False):
+                ids.add(id(p))
+    return ids
+
+#======================================================================#
+def split_params_adamw(model, no_decay_types=NO_DECAY_TYPES, latent_types=LATENT_TYPES):
+    decay_params = []
+    no_decay_params = []
+    latent_params = []
+
+    latent_param_ids = _collect_param_ids_by_module_types(model, latent_types)
+    no_decay_param_ids = _collect_param_ids_by_module_types(model, no_decay_types)
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue  # skip frozen weights
-        if name.endswith(".bias") or "LayerNorm" in name or "layernorm" in name or "embedding" in name.lower():
-            no_decay.append(param)
-        elif 'latent' in name:
-            no_decay.append(param)
-        elif 'cls_token' in name:
-            no_decay.append(param)
-        elif 'pos_embed' in name:
-            no_decay.append(param)
+        if (
+            (no_decay_param_ids is not None and id(param) in no_decay_param_ids) or 
+            name.endswith("bias") or 
+            "LayerNorm" in name or "layernorm" in name or 
+            "RMSNorm" in name or "rmsnorm" in name or
+            "embed" in name.lower() or
+            "cls_token" in name
+        ):
+            no_decay_params.append(param)
+        elif (
+            "latent" in name and
+            (latent_param_ids is not None and id(param) in latent_param_ids)
+        ):
+            latent_params.append(param)
         else:
-            decay.append(param)
+            decay_params.append(param)
 
-    return decay, no_decay
+    return decay_params, no_decay_params, latent_params
 
 #======================================================================#
-def make_optimizer_adamw(model, lr, weight_decay=0.0, betas=None, eps=None, **kwargs):
-    betas = betas if betas is not None else (0.9, 0.999)
-    eps = eps if eps is not None else 1e-8
+def make_optimizer_adamw(model, lr, weight_decay=0.0, beta1=0.9, beta2=0.999, eps=1e-8):
+    decay_params, no_decay_params, latent_params = split_params_adamw(model, NO_DECAY_TYPES, LATENT_TYPES)
 
-    decay, no_decay = split_params(model)
+    if isinstance(lr, float) or isinstance(lr, int):
+        lr = [lr] * 3
+    if isinstance(weight_decay, float) or isinstance(weight_decay, int):
+        weight_decay = [weight_decay, 0.0, 0.0]
+    if isinstance(beta1, float) or isinstance(beta1, int):
+        beta1 = [beta1] * 3
+    if isinstance(beta2, float) or isinstance(beta2, int):
+        beta2 = [beta2] * 3
+    if isinstance(eps, float) or isinstance(eps, int):
+        eps = [eps] * 3
 
-    optimizer = torch.optim.AdamW([
-        {'params': decay, 'weight_decay': weight_decay},
-        {'params': no_decay, 'weight_decay': 0.0}
-    ], lr=lr, betas=betas, eps=eps)
+    assert len(lr) == 3, f"lr must be a list of 3 elements, got {lr} with {len(lr)} elements"
+    assert len(weight_decay) == 3, f"weight_decay must be a list of 3 elements, got {weight_decay} with {len(weight_decay)} elements"
+    assert len(beta1) == 3, f"beta1 must be a list of 3 elements, got {beta1} with {len(beta1)} elements"
+    assert len(beta2) == 3, f"beta2 must be a list of 3 elements, got {beta2} with {len(beta2)} elements"
+    assert len(eps) == 3, f"eps must be a list of 3 elements, got {eps} with {len(eps)} elements"
+
+    decay_param_group = {
+        'params': decay_params,
+        'weight_decay': weight_decay[0],
+        'lr': lr[0],
+        'betas': (beta1[0], beta2[0]),
+        'eps': eps[0]
+    }
+    no_decay_param_group = {
+        'params': no_decay_params,
+        'weight_decay': weight_decay[1],
+        'lr': lr[1],
+        'betas': (beta1[1], beta2[1]),
+        'eps': eps[1]
+    }
+    latent_param_group = {
+        'params': latent_params,
+        'weight_decay': weight_decay[2],
+        'lr': lr[2],
+        'betas': (beta1[2], beta2[2]),
+        'eps': eps[2]
+    }
+
+    param_groups = [decay_param_group, no_decay_param_group, latent_param_group]
+    optimizer = torch.optim.AdamW(param_groups)
 
     return optimizer
 
-def make_optimizer_lion(model, lr, weight_decay=0.0, betas=None, eps=None, **kwargs):
+def make_optimizer_lion(model, lr, weight_decay=0.0, beta1=0.9, beta2=0.999, eps=1e-8):
+    decay_params, no_decay_params, latent_params = split_params_adamw(model, NO_DECAY_TYPES)
+    
+    if isinstance(lr, float) or isinstance(lr, int):
+        lr = [lr] * 3
+    if isinstance(weight_decay, float) or isinstance(weight_decay, int):
+        weight_decay = [weight_decay, 0.0, 0.0]
+    if isinstance(beta1, float) or isinstance(beta1, int):
+        beta1 = [beta1] * 3
+    if isinstance(beta2, float) or isinstance(beta2, int):
+        beta2 = [beta2] * 3
+    if isinstance(eps, float) or isinstance(eps, int):
+        eps = [eps] * 3
+
+    assert len(lr) == 3, f"lr must be a list of 3 elements, got {lr} with {len(lr)} elements"
+    assert len(weight_decay) == 3, f"weight_decay must be a list of 3 elements, got {weight_decay} with {len(weight_decay)} elements"
+    assert len(beta1) == 3, f"beta1 must be a list of 3 elements, got {beta1} with {len(beta1)} elements"
+    assert len(beta2) == 3, f"beta2 must be a list of 3 elements, got {beta2} with {len(beta2)} elements"
+    assert len(eps) == 3, f"eps must be a list of 3 elements, got {eps} with {len(eps)} elements"
+
+    decay_param_group = {
+        'params': decay_params,
+        'lr': lr[0],
+        'weight_decay': weight_decay[0],
+        'betas': (beta1[0], beta2[0]),
+        'eps': eps[0]
+    }
+    no_decay_param_group = {
+        'params': no_decay_params,
+        'lr': lr[1],
+        'weight_decay': weight_decay[1],
+        'betas': (beta1[1], beta2[1]),
+        'eps': eps[1]
+    }
+    latent_param_group = {
+        'params': latent_params,
+        'lr': lr[2],
+        'weight_decay': weight_decay[2],
+        'betas': (beta1[2], beta2[2]),
+        'eps': eps[2]
+    }
+    
+    param_groups = [decay_param_group, no_decay_param_group, latent_param_group]
+    optimizer = Lion(param_groups)
+
+    return optimizer
+
+def make_optimizer_muon(model, lr, weight_decay=0.0, betas=None, eps=None, **kwargs):
     betas = betas if betas is not None else (0.9, 0.999)
     eps = eps if eps is not None else 1e-8
 
-    decay, no_decay = split_params(model)
-    
-    optimizer = Lion([
-        {'params': decay, 'weight_decay': weight_decay},
-        {'params': no_decay, 'weight_decay': 0.0}
-    ], lr=lr, betas=betas, eps=eps)
+    import torch.distributed as dist
+    try:
+        is_distributed = dist.is_available() and dist.is_initialized()
+    except:
+        is_distributed = False
+
+    if is_distributed:
+        from .muon import MuonWithAuxAdam
+    else:
+        from .muon import SingleDeviceMuonWithAuxAdam
+
+    adamw_params_decay = []
+    adamw_params_no_decay = []
+    adamw_params_latent = []
+    muon_params_decay = []
+    no_decay_param_ids = _collect_param_ids_by_module_types(model, NO_DECAY_TYPES)
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue  # skip frozen weights
+
+        if "block" in name and param.ndim >= 2 and "latent" not in name:
+            muon_params_decay.append(param)
+        else:
+            if (
+                (no_decay_param_ids is not None and id(param) in no_decay_param_ids) or 
+                name.endswith(".bias") or 
+                "LayerNorm" in name or "layernorm" in name or 
+                "RMSNorm" in name or "rmsnorm" in name or
+                "pos_embed" in name or
+                "embedding" in name.lower() or
+                "cls_token" in name
+            ):
+                adamw_params_no_decay.append(param)
+            elif (
+                "latent" in name
+            ):
+                adamw_params_latent.append(param)
+            else:
+                adamw_params_decay.append(param)
+
+    # assemble param groups
+    if isinstance(lr, float) or isinstance(lr, int):
+        lr = [lr] * 4
+    if isinstance(weight_decay, float) or isinstance(weight_decay, int):
+        weight_decay = [weight_decay, 0.0, 0.0, 0.0, weight_decay]
+    if isinstance(beta1, float) or isinstance(beta1, int):
+        beta1 = [beta1] * 4
+    if isinstance(beta2, float) or isinstance(beta2, int):
+        beta2 = [beta2] * 4
+    if isinstance(eps, float) or isinstance(eps, int):
+        eps = [eps] * 4
+
+    assert len(lr) == 4, f"lr must be a list of 4 elements, got {lr} with {len(lr)} elements"
+    assert len(weight_decay) == 4, f"weight_decay must be a list of 4 elements, got {weight_decay} with {len(weight_decay)} elements"
+    assert len(beta1) == 4, f"beta1 must be a list of 4 elements, got {beta1} with {len(beta1)} elements"
+    assert len(beta2) == 4, f"beta2 must be a list of 4 elements, got {beta2} with {len(beta2)} elements"
+    assert len(eps) == 4, f"eps must be a list of 4 elements, got {eps} with {len(eps)} elements"
+
+    adamw_decay_group = {
+        'params': adamw_params_decay,
+        'lr': lr[0],
+        'weight_decay': weight_decay[0],
+        'betas': (beta1[0], beta2[0]),
+        'eps': eps[0],
+        'use_muon': False,
+    }
+    adamw_no_decay_group = {
+        'params': adamw_params_no_decay,
+        'lr': lr[1],
+        'weight_decay': weight_decay[1],
+        'betas': (beta1[1], beta2[1]),
+        'eps': eps[1],
+        'use_muon': False,
+    }
+    adamw_latent_group = {
+        'params': adamw_params_latent,
+        'lr': lr[2],
+        'weight_decay': weight_decay[2],
+        'betas': (beta1[2], beta2[2]),
+        'eps': eps[2],
+        'use_muon': False,
+    }
+    muon_group = {
+        'params': muon_params_decay,
+        'lr': lr[3],
+        'weight_decay': weight_decay[3],
+        'momentum': beta1[3],
+        'use_muon': True,
+    }
+
+    param_groups = [adamw_decay_group, adamw_no_decay_group, adamw_latent_group, muon_group]
+
+    if is_distributed:
+        optimizer = MuonWithAuxAdam(param_groups)
+    else:
+        optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
 
     return optimizer
 
@@ -107,7 +316,7 @@ class Lion(Optimizer):
 
         for group in self.param_groups:
             lr = group["lr"]
-            beta1, beta2 = group["betas"]
+            beta1, _ = group["betas"]
             wd = group["weight_decay"]
 
             for p in group["params"]:

@@ -26,9 +26,14 @@ elif MACHINE.startswith("v"):
     DATADIR_BASE = '/ocean/projects/eng170006p/vpuri1/data/'
 
 #======================================================================#
+dotdot = lambda dir: os.path.abspath(os.path.join(dir, '..'))
 PROJDIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 CASEDIR = os.path.join(PROJDIR, 'out', 'am')
 os.makedirs(CASEDIR, exist_ok=True)
+
+TRITON_CACHE_DIR = os.path.join(dotdot(PROJDIR), ".triton")
+os.makedirs(TRITON_CACHE_DIR, exist_ok=True)
+os.environ["TRITON_CACHE_DIR"] = TRITON_CACHE_DIR
 
 #======================================================================#
 DATADIR_RAW        = os.path.join(DATADIR_BASE, 'netfabb_ti64_hires_raw')

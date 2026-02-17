@@ -5,7 +5,6 @@ import math
 
 import torch
 import torch.nn.functional as F
-import torch_geometric as pyg
 import torch.distributed as dist
 
 import gc
@@ -18,10 +17,6 @@ import matplotlib.pyplot as plt
 
 import mlutils
 import pdebench
-
-import am
-from am.callbacks import timeseries_statistics_plot
-from am.callbacks import hstack_dataframes_across_ranks, vstack_dataframes_across_ranks
 
 __all__ = [
     'RelL2Callback',
@@ -37,14 +32,14 @@ class RelL2Callback(mlutils.Callback):
         self.dataset = dataset
 
     @torch.no_grad()
-    def evaluate(self, trainer: mlutils.Trainer, ckpt_dir: str):
-        
+    def evaluate(self, trainer: mlutils.Trainer, ckpt_dir: str, stat_vals: dict):
+
         trainer.model.eval()
         device = trainer.device
 
         lossfun = pdebench.RelL2Loss()
         y_normalizer = self.y_normalizer.to(device)
-        
+
         _N, _rel_error, _r2 = 0, 0., []
         N_, rel_error_, r2_ = 0, 0., []
 
@@ -82,22 +77,13 @@ class RelL2Callback(mlutils.Callback):
         r2_ = torch.tensor(r2_)
 
         if trainer.DDP:
-
             # relative error
-            _rel_error = torch.tensor(_rel_error, device=trainer.device)
-            rel_error_ = torch.tensor(rel_error_, device=trainer.device)
-
-            _N = torch.tensor(_N, device=trainer.device)
-            N_ = torch.tensor(N_, device=trainer.device)
-
-            dist.all_reduce(_rel_error, dist.ReduceOp.SUM)
-            dist.all_reduce(rel_error_, dist.ReduceOp.SUM)
-
-            dist.all_reduce(_N, dist.ReduceOp.SUM)
-            dist.all_reduce(N_, dist.ReduceOp.SUM)
-
-            _N, _rel_error = _N.item(), _rel_error.item()
-            N_, rel_error_ = N_.item(), rel_error_.item()
+            pre_ddp, post_ddp = [_rel_error, rel_error_, _N, N_], []
+            for p in pre_ddp:
+                p = torch.tensor(p, device=trainer.device)
+                dist.all_reduce(p, dist.ReduceOp.SUM)
+                post_ddp.append(p.item())
+            _rel_error, rel_error_, _N, N_ = post_ddp
 
             # R-Squared
             _r2 = _r2.to(device)
@@ -133,7 +119,7 @@ class RelL2Callback(mlutils.Callback):
 class ScoresCallback(mlutils.Callback):
 
     @torch.no_grad()
-    def evaluate(self, trainer: mlutils.Trainer, ckpt_dir: str):
+    def evaluate(self, trainer: mlutils.Trainer, ckpt_dir: str, stat_vals: dict):
 
         trainer.model.eval()
         case_dir = self.case_dir
@@ -309,53 +295,37 @@ class ScoresCallback(mlutils.Callback):
             "text.latex.preamble": r"\usepackage{amsmath}"
         })
 
-        # Determine number of axes and which blocks to plot
-        if num_blocks == 1:
-            n_axes = 1
-            blocks_to_plot = [0]
-        elif num_blocks == 2:
-            n_axes = 2
-            blocks_to_plot = [0, 1]
-        else:  # num_blocks >= 3
-            n_axes = 3
-            blocks_to_plot = [0, num_blocks // 2, num_blocks - 1]
-        
-        fig, axes = plt.subplots(1, n_axes, figsize=(n_axes * 5.33, 6))
-        if n_axes == 1:
-            axes = [axes]  # Make it a list for consistent iteration
-        else:
-            axes = list(axes)
-        
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 6))
         fontsize = 28
         
-        for ax in axes:
+        for ax in [ax1, ax2, ax3]:
             ax.set_xscale('linear')
             ax.set_yscale('log', base=10)
             ax.grid(True, which="both", ls="-", alpha=0.5)
             ax.set_ylim(1e-8, 2e-0)
             ax.set_yticks([1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e-0])
 
-        # Set y-axis labels only on the first axis
-        axes[0].set_yticklabels(['1e-8', '1e-7', '1e-6', '1e-5', '1e-4', '1e-3', '1e-2', '1e-1', '1e-0'])
-        for ax in axes[1:]:
-            ax.set_yticklabels(['', '', '', '', '', '', '', '', ''])
+        ax1.set_yticklabels(['1e-8', '1e-7', '1e-6', '1e-5', '1e-4', '1e-3', '1e-2', '1e-1', '1e-0'])
+        ax2.set_yticklabels(['', '', '', '', '', '', '', '', ''])
+        ax3.set_yticklabels(['', '', '', '', '', '', '', '', ''])
 
-        for ax in axes:
+        for ax in [ax1, ax2, ax3]:
             ax.tick_params(axis='both', which='major', labelsize=fontsize)
 
-        axes[0].set_ylabel(r'Eigenvalue magnitude', fontsize=fontsize)
-        for ax in axes:
-            ax.set_xlabel(r'Eigenvalue Index', fontsize=fontsize)
+        ax1.set_ylabel(r'Eigenvalue magnitude', fontsize=fontsize)
+        ax1.set_xlabel(r'Eigenvalue Index', fontsize=fontsize)
+        ax2.set_xlabel(r'Eigenvalue Index', fontsize=fontsize)
+        ax3.set_xlabel(r'Eigenvalue Index', fontsize=fontsize)
 
-        # Set titles based on actual block numbers
-        for i, block_idx in enumerate(blocks_to_plot):
-            axes[i].set_title(r'Block %d' % (block_idx + 1), fontsize=fontsize)
-
+        ax1.set_title(r'Block 1', fontsize=fontsize)
+        ax2.set_title(r'Block 5', fontsize=fontsize)
+        ax3.set_title(r'Block 8', fontsize=fontsize)
+        
         linewidth = 2.5
 
-        for block_idx, ax in zip(blocks_to_plot, axes):
+        for block, ax in zip([0, 4, 7], [ax1, ax2, ax3]):
             for h in range(num_heads):
-                ax.plot(eigenvals_means[block_idx][h, :cutoff], linewidth=linewidth)
+                ax.plot(eigenvals_means[block][h, :cutoff], linewidth=linewidth)
 
             ax.axvline(x=num_latents-1, color='red', linestyle='--', linewidth=linewidth, label=r'Number of latents = %d' % num_latents)
             ax.axhline(y=torch.finfo(torch.float32).eps, color='black', linestyle='--', linewidth=linewidth, label=r'Float32 Precision')

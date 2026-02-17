@@ -3,8 +3,43 @@
 #=========================================#
 PROJ_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DATA_DIR=${PROJ_DIR}/data
-export HF_HOME=${DATA_DIR}/huggingface
 
+#=========================================#
+# Redirect all caches to project space to avoid disk quota issues
+#=========================================#
+PY_CACHE_BASE="${PROJ_DIR}/../cache"
+
+echo "Setting cache base to: ${PY_CACHE_BASE}"
+
+export PIP_CACHE_DIR="${PY_CACHE_BASE}/pip"
+export UV_CACHE_DIR="${PY_CACHE_BASE}/uv"
+export XDG_CACHE_HOME="${PY_CACHE_BASE}"
+export HF_HOME="${PY_CACHE_BASE}/huggingface"
+export HUGGINGFACE_HUB_CACHE="${PY_CACHE_BASE}/huggingface"
+export TORCH_HOME="${PY_CACHE_BASE}/torch"
+export WANDB_CACHE_DIR="${PY_CACHE_BASE}/wandb"
+export TRITON_CACHE_DIR="${PY_CACHE_BASE}/triton"
+export DATASETS_CACHE="${PY_CACHE_BASE}/datasets"
+export MPLCONFIGDIR="${PY_CACHE_BASE}/matplotlib"
+export HF_DATASETS_CACHE="${PY_CACHE_BASE}/datasets"
+export HF_HUB_CACHE="${PY_CACHE_BASE}/huggingface"
+
+mkdir -p "${PY_CACHE_BASE}"
+mkdir -p "${PIP_CACHE_DIR}"
+mkdir -p "${UV_CACHE_DIR}"
+mkdir -p "${XDG_CACHE_HOME}"
+mkdir -p "${TORCH_HOME}"
+mkdir -p "${WANDB_CACHE_DIR}"
+mkdir -p "${TRITON_CACHE_DIR}"
+mkdir -p "${DATASETS_CACHE}"
+mkdir -p "${HF_DATASETS_CACHE}"
+mkdir -p "${HF_HUB_CACHE}"
+mkdir -p "$MPLCONFIGDIR"
+mkdir -p "${HF_HOME}"
+mkdir -p "${HF_DATASETS_CACHE}"
+mkdir -p "${HF_HUB_CACHE}"
+
+#=========================================#
 mkdir -p ${DATA_DIR}
 cd ${DATA_DIR}
 
@@ -87,7 +122,7 @@ for num_points in 10k 40k 100k 200k 300k 400k 500k 1m; do
     rm -rf drivaerml_surface_presampled_${num_points}.tar.gz
 done
 
+#=========================================#
 cd $DATA_DIR
-
 #=========================================#
 #

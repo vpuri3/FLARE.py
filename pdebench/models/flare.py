@@ -12,7 +12,6 @@ __all__ = [
 #======================================================================#
 # Activation Functions
 #======================================================================#
-
 ACTIVATIONS = {
     'gelu': nn.GELU(approximate='tanh'),
     'silu': nn.SiLU(),
@@ -68,9 +67,14 @@ class FLARE(nn.Module):
         channel_dim: int,
         num_heads: int = 8,
         num_latents: int = 32,
+        attn_scale: float = 1.0,
         act: str = None,
-        num_layers_kv_proj: int = 3,
-        kv_proj_hidden_dim: int = None,
+        num_layers_k_proj: int = 3,
+        num_layers_v_proj: int = 3,
+        k_proj_mlp_ratio: float = 1.0,
+        v_proj_mlp_ratio: float = 1.0,
+        qk_norm: bool = False,
+        rmsnorm: bool = False,
     ):
         super().__init__()
 
@@ -80,21 +84,38 @@ class FLARE(nn.Module):
         self.head_dim = self.channel_dim // self.num_heads
 
         assert self.channel_dim % self.num_heads == 0, f"channel_dim must be divisible by num_heads. Got {self.channel_dim} and {self.num_heads}."
+        assert attn_scale > 0.0, f"attn_scale must be greater than 0. Got {attn_scale}."
+
+        self.attn_scale = attn_scale
 
         self.latent_q = nn.Parameter(torch.empty(self.channel_dim, self.num_latents))
         nn.init.normal_(self.latent_q, mean=0.0, std=0.1)
+        
+        self.qk_norm = qk_norm
+        if self.qk_norm:
+            Norm = nn.RMSNorm if rmsnorm else nn.LayerNorm
+            self.q_norm = Norm(self.head_dim)
+            self.k_norm = Norm(self.head_dim)
 
-        self.k_proj, self.v_proj = [
-            ResidualMLP(
-                in_dim=self.channel_dim,
-                hidden_dim=kv_proj_hidden_dim,
-                out_dim=self.channel_dim,
-                num_layers=num_layers_kv_proj,
-                act=act,
-                input_residual=True,
-                output_residual=True,
-            ) for _ in range(2)
-        ]
+        self.k_proj = ResidualMLP(
+            in_dim=self.channel_dim,
+            hidden_dim=int(self.channel_dim * k_proj_mlp_ratio),
+            out_dim=self.channel_dim,
+            num_layers=num_layers_k_proj,
+            act=act,
+            input_residual=True,
+            output_residual=True,
+        )
+
+        self.v_proj = ResidualMLP(
+            in_dim=self.channel_dim,
+            hidden_dim=int(self.channel_dim * v_proj_mlp_ratio),
+            out_dim=self.channel_dim,
+            num_layers=num_layers_v_proj,
+            act=act,
+            input_residual=True,
+            output_residual=True,
+        )
 
         self.out_proj = nn.Linear(self.channel_dim, self.channel_dim)
 
@@ -105,12 +126,16 @@ class FLARE(nn.Module):
         q = self.latent_q.view(self.num_heads, self.num_latents, self.head_dim) # [H M D]
         k = rearrange(self.k_proj(x), 'b n (h d) -> b h n d', h=self.num_heads) # [B H N D]
         v = rearrange(self.v_proj(x), 'b n (h d) -> b h n d', h=self.num_heads)
+        
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         #--------------------------------------------#
         if not return_scores:
             q = q.unsqueeze(0).expand(x.size(0), -1, -1, -1) # required for fused attention
-            z = F.scaled_dot_product_attention(q, k, v, scale=1.0)
-            y = F.scaled_dot_product_attention(k, q, z, scale=1.0)
+            z = F.scaled_dot_product_attention(q, k, v, scale=self.attn_scale)
+            y = F.scaled_dot_product_attention(k, q, z, scale=self.attn_scale)
             scores = None
         else:
             # (1) Compute projection weights
@@ -139,28 +164,38 @@ class FLAREBlock(nn.Module):
         channel_dim: int,
         num_heads: int = None,
         num_latents: int = None,
+        attn_scale: float = 1.0,
         act: str = None,
-        num_layers_kv_proj: int = 3,
-        num_layers_mlp: int = 3,
-        kv_proj_hidden_dim: int = None,
-        mlp_hidden_dim: int = None,
+        rmsnorm: bool = False,
+        num_layers_k_proj: int = 3,
+        num_layers_v_proj: int = 3,
+        k_proj_mlp_ratio: float = 1.0,
+        v_proj_mlp_ratio: float = 1.0,
+        num_layers_ffn: int = 3,
+        ffn_mlp_ratio: float = 1.0,
+        qk_norm: bool = False,
     ):
         super().__init__()
-        self.ln1 = nn.LayerNorm(channel_dim)
-        self.ln2 = nn.LayerNorm(channel_dim)
+        self.norm1 = nn.RMSNorm(channel_dim) if rmsnorm else nn.LayerNorm(channel_dim)
+        self.norm2 = nn.RMSNorm(channel_dim) if rmsnorm else nn.LayerNorm(channel_dim)
         self.att = FLARE(
             channel_dim=channel_dim,
             num_heads=num_heads,
             num_latents=num_latents,
+            attn_scale=attn_scale,
             act=act,
-            num_layers_kv_proj=num_layers_kv_proj,
-            kv_proj_hidden_dim=kv_proj_hidden_dim,
+            num_layers_k_proj=num_layers_k_proj,
+            num_layers_v_proj=num_layers_v_proj,
+            k_proj_mlp_ratio=k_proj_mlp_ratio,
+            v_proj_mlp_ratio=v_proj_mlp_ratio,
+            qk_norm=qk_norm,
+            rmsnorm=rmsnorm,
         )
         self.mlp = ResidualMLP(
             in_dim=channel_dim,
-            hidden_dim=mlp_hidden_dim,
+            hidden_dim=int(channel_dim * ffn_mlp_ratio),
             out_dim=channel_dim,
-            num_layers=num_layers_mlp,
+            num_layers=num_layers_ffn,
             act=act,
             input_residual=True,
             output_residual=True,
@@ -169,18 +204,18 @@ class FLAREBlock(nn.Module):
     def forward(self, x, return_scores: bool = False):
         # x: [B, N, C]
 
-        # x = x + att(ln1(x))
-        # x = x + mlp(ln2(x))
+        # x = x + att(norm1(x))
+        # x = x + mlp(norm2(x))
         # return x
 
-        _x, scores = self.att(self.ln1(x), return_scores=return_scores)
+        _x, scores = self.att(self.norm1(x), return_scores=return_scores)
         x = x + _x
-        x = x + self.mlp(self.ln2(x))
+        x = x + self.mlp(self.norm2(x))
 
         return x, scores
 
 #======================================================================#
-# Final Layer
+# Final Layer (Perceiver compatibility)
 #======================================================================#
 class FinalLayer(nn.Module):
     def __init__(
@@ -194,7 +229,6 @@ class FinalLayer(nn.Module):
     ):
         if hidden_dim is None:
             hidden_dim = channel_dim
-
         super().__init__()
         self.ln = nn.LayerNorm(channel_dim) if ln else nn.Identity()
         self.mlp = ResidualMLP(
@@ -220,55 +254,66 @@ class FLAREModel(nn.Module):
         out_dim: int,
         channel_dim: int = 64,
         num_blocks: int = 8,
-        num_latents: int = None,
         num_heads: int = None,
         act: str = None,
-        #
-        num_layers_kv_proj: int = 3,
-        num_layers_mlp: int = 3,
+        rmsnorm: bool = False,
+        out_proj_norm: bool = True,
         num_layers_in_out_proj: int = 2,
         #
-        mlp_ratio: float = 1.0,
-        kv_proj_ratio: float = 1.0,
-        in_out_proj_ratio: float = 1.0,
-        #
-        out_proj_ln: bool = True,
+        attn_scale: float = 1.0,
+        num_latents: int = None,
+        num_layers_k_proj: int = 3,
+        num_layers_v_proj: int = 3,
+        k_proj_mlp_ratio: float = 1.0,
+        v_proj_mlp_ratio: float = 1.0,
+        num_layers_ffn: int = 3,
+        ffn_mlp_ratio: float = 1.0,
+        qk_norm: bool = False,
     ):
         super().__init__()
-        
-        mlp_hidden_dim = int(channel_dim * mlp_ratio)
-        kv_proj_hidden_dim = int(channel_dim * kv_proj_ratio)
-        in_out_proj_hidden_dim = int(channel_dim * in_out_proj_ratio)
 
         self.in_proj = ResidualMLP(
             in_dim=in_dim,
-            hidden_dim=in_out_proj_hidden_dim,
+            hidden_dim=channel_dim,
             out_dim=channel_dim,
             num_layers=num_layers_in_out_proj,
             act=act,
+            input_residual=False,
             output_residual=True,
         )
-        self.out_proj = FinalLayer(
-            channel_dim=channel_dim,
-            hidden_dim=in_out_proj_hidden_dim,
-            out_dim=out_dim,
-            act=act,
-            num_layers=num_layers_in_out_proj,
-            ln=out_proj_ln,
+        
+        Norm = nn.RMSNorm if rmsnorm else nn.LayerNorm
+
+        self.out_proj = nn.Sequential(
+            Norm(channel_dim) if out_proj_norm else nn.Identity(),
+            ResidualMLP(
+                in_dim=channel_dim,
+                hidden_dim=channel_dim,
+                out_dim=out_dim,
+                num_layers=num_layers_in_out_proj,
+                act=act,
+                input_residual=True,
+                output_residual=False,
+            )
         )
 
         self.blocks = nn.ModuleList([
             FLAREBlock(
                 channel_dim=channel_dim,
-                num_latents=num_latents,
                 num_heads=num_heads,
                 act=act,
-                num_layers_kv_proj=num_layers_kv_proj,
-                num_layers_mlp=num_layers_mlp,
-                kv_proj_hidden_dim=kv_proj_hidden_dim,
-                mlp_hidden_dim=mlp_hidden_dim,
+                rmsnorm=rmsnorm,
+                attn_scale=attn_scale,
+                num_latents=num_latents,
+                num_layers_k_proj=num_layers_k_proj,
+                num_layers_v_proj=num_layers_v_proj,
+                k_proj_mlp_ratio=k_proj_mlp_ratio,
+                v_proj_mlp_ratio=v_proj_mlp_ratio,
+                num_layers_ffn=num_layers_ffn,
+                ffn_mlp_ratio=ffn_mlp_ratio,
+                qk_norm=qk_norm,
             )
-            for i in range(num_blocks)
+            for _ in range(num_blocks)
         ])
 
         self.initialize_weights()
@@ -281,9 +326,11 @@ class FLAREModel(nn.Module):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0.)
-        elif isinstance(m, (nn.LayerNorm,)):
-            nn.init.constant_(m.bias, 0.)
-            nn.init.constant_(m.weight, 1.)
+        elif isinstance(m, (nn.LayerNorm, nn.RMSNorm)):
+            if hasattr(m, 'weight') and m.weight is not None:
+                nn.init.constant_(m.weight, 1.)
+            if hasattr(m, 'bias') and m.bias is not None:
+                nn.init.constant_(m.bias, 0.)
 
     def forward(self, x, return_scores: bool = False):
         # x: [B, N, C]
@@ -302,189 +349,4 @@ class FLAREModel(nn.Module):
         return (x, scores) if return_scores else x
 
 #======================================================================#
-# TESTING
-#======================================================================#
-def flare_vanilla(q, k, v):
-    """
-    Inputs:
-    q: [H, M, D]
-    k: [B, H, N, D]
-    v: [B, H, N, D]
-    Outputs:
-    y: [B, H, N, D]
-    """
-
-    S = q @ k.transpose(-2, -1) # [B H M N]
-    We = F.softmax(S, dim=-1) # sum over N
-    Wd = F.softmax(S.transpose(-2, -1), dim=-1) # sum over M
-    z = We @ v # [B H M D]
-    y = Wd @ z # [B H N D]
-
-    return y
-
-def flare_fused(q, k, v):
-    """
-    Inputs:
-    q: [H, M, D]
-    k: [B, H, N, D]
-    v: [B, H, N, D]
-    Outputs:
-    y: [B, H, N, D]
-    """
-    
-    q = q.unsqueeze(0).expand(k.size(0), -1, -1, -1)
-    z = F.scaled_dot_product_attention(q, k, v, scale=1.0)
-    y = F.scaled_dot_product_attention(k, q, z, scale=1.0)
-
-    return y
-
-def benchmark(B, H, M, N, D, device, dtype, verbose=False):
-
-    q_vanilla = torch.randn(H, N, D, device=device, dtype=dtype, requires_grad=True)
-    k_vanilla = torch.randn(B, H, N, D, device=device, dtype=dtype, requires_grad=True)
-    v_vanilla = torch.randn(B, H, N, D, device=device, dtype=dtype, requires_grad=True)
-
-    q_fused = q_vanilla.clone().detach().requires_grad_(True)
-    k_fused = k_vanilla.clone().detach().requires_grad_(True)
-    v_fused = v_vanilla.clone().detach().requires_grad_(True)
-
-    #--------------------------------------------#
-    # Measure vanilla implementation - forward pass
-    #--------------------------------------------#
-
-    torch.cuda.reset_peak_memory_stats(device)
-    torch.cuda.synchronize()
-    start_time = torch.cuda.Event(enable_timing=True)
-    end_time = torch.cuda.Event(enable_timing=True)
-
-    start_time.record()
-    y_vanilla = flare_vanilla(q_vanilla, k_vanilla, v_vanilla)
-    end_time.record()
-    torch.cuda.synchronize()
-
-    vanilla_time_fwd = start_time.elapsed_time(end_time)
-    vanilla_memory_fwd = torch.cuda.max_memory_allocated(device) / (1024 ** 2)  # MB
-
-    #--------------------------------------------#
-    # Measure fused implementation - forward pass
-    #--------------------------------------------#
-
-    torch.cuda.reset_peak_memory_stats(device)
-    torch.cuda.synchronize()
-    start_time = torch.cuda.Event(enable_timing=True)
-    end_time = torch.cuda.Event(enable_timing=True)
-
-    start_time.record()
-    y_fused = flare_fused(q_fused, k_fused, v_fused)
-    end_time.record()
-    torch.cuda.synchronize()
-
-    fused_time_fwd = start_time.elapsed_time(end_time)
-    fused_memory_fwd = torch.cuda.max_memory_allocated(device) / (1024 ** 2)  # MB
-
-    #--------------------------------------------#
-    # Compute forward pass differences
-    #--------------------------------------------#
-
-    time_speedup_fwd = vanilla_time_fwd / fused_time_fwd
-    mem_reduction_fwd = fused_memory_fwd / vanilla_memory_fwd
-    value_diff_fwd = torch.abs(y_vanilla - y_fused).mean().item()
-
-    #--------------------------------------------#
-    # Create dummy gradients for backward pass
-    #--------------------------------------------#
-
-    grad_output = torch.randn_like(y_vanilla)
-    grad_output_fused = grad_output.clone()
-
-    #--------------------------------------------#
-    # Measure vanilla implementation - backward pass
-    #--------------------------------------------#
-
-    torch.cuda.reset_peak_memory_stats(device)
-    torch.cuda.synchronize()
-    start_time = torch.cuda.Event(enable_timing=True)
-    end_time = torch.cuda.Event(enable_timing=True)
-
-    start_time.record()
-    y_vanilla.backward(grad_output, retain_graph=True)
-    end_time.record()
-    torch.cuda.synchronize()
-
-    vanilla_time_bwd = start_time.elapsed_time(end_time)
-    vanilla_memory_bwd = torch.cuda.max_memory_allocated(device) / (1024 ** 2)  # MB
-
-    #--------------------------------------------#
-    # Measure fused implementation - backward pass
-    #--------------------------------------------#
-
-    torch.cuda.reset_peak_memory_stats(device)
-    torch.cuda.synchronize()
-    start_time = torch.cuda.Event(enable_timing=True)
-    end_time = torch.cuda.Event(enable_timing=True)
-
-    start_time.record()
-    y_fused.backward(grad_output_fused, retain_graph=True)
-    end_time.record()
-    torch.cuda.synchronize()
-
-    fused_time_bwd = start_time.elapsed_time(end_time)
-    fused_memory_bwd = torch.cuda.max_memory_allocated(device) / (1024 ** 2)  # MB
-
-    #--------------------------------------------#
-    # Compute backward pass differences
-    #--------------------------------------------#
-
-    time_speedup_bwd = vanilla_time_bwd / fused_time_bwd
-    mem_reduction_bwd = fused_memory_bwd / vanilla_memory_bwd
-
-    # Compare gradients
-    grad_diff_q = torch.abs(q_vanilla.grad - q_fused.grad).mean().item()
-    grad_diff_k = torch.abs(k_vanilla.grad - k_fused.grad).mean().item()
-    grad_diff_v = torch.abs(v_vanilla.grad - v_fused.grad).mean().item()
-
-    #--------------------------------------------#
-    # Print results
-    #--------------------------------------------#
-
-    if verbose:
-        print("=" * 80)
-        print(f"{'':^15}|{'Vanilla':^20}|{'Fused':^20}|{'Comparison':^20}")
-        print("=" * 80)
-        print(f"{'Forward Pass':^15}|{'':<20}|{'':<20}|{'':<20}")
-        print(f"{'Time (ms)':^15}|{vanilla_time_fwd:^20.2f}|{fused_time_fwd:^20.2f}|{f'Speedup: {time_speedup_fwd:.2f}x':^20}")
-        print(f"{'Memory (MB)':^15}|{vanilla_memory_fwd:^20.2f}|{fused_memory_fwd:^20.2f}|{f'Ratio: {mem_reduction_fwd:.2f}':^20}")
-        print(f"{'Value diff':^15}|{'':<20}|{'':<20}|{value_diff_fwd:^20.6f}")
-        print("-" * 80)
-        print(f"{'Backward Pass':^15}|{'':<20}|{'':<20}|{'':<20}")
-        print(f"{'Time (ms)':^15}|{vanilla_time_bwd:^20.2f}|{fused_time_bwd:^20.2f}|{f'Speedup: {time_speedup_bwd:.2f}x':^20}")
-        print(f"{'Memory (MB)':^15}|{vanilla_memory_bwd:^20.2f}|{fused_memory_bwd:^20.2f}|{f'Ratio: {mem_reduction_bwd:.2f}':^20}")
-        print(f"{'Gradient diff':^15}|{'':<20}|{'':<20}|{f'q={grad_diff_q:.6f}':^20}")
-        print(f"{'':<15}|{'':<20}|{'':<20}|{f'k={grad_diff_k:.6f}':^20}")
-        print(f"{'':<15}|{'':<20}|{'':<20}|{f'v={grad_diff_v:.6f}':^20}")
-        print("=" * 80)
-
-    return
-
-def cublas_warmup(device):
-    a = torch.randn(2, 2, device=device, requires_grad=True)
-    b = torch.randn(2, 2, device=device, requires_grad=True)
-    c = a @ b
-    c.sum().backward()  # Force backward cuBLAS initialization
-    del a, b, c  # Clean up
-
-if __name__ == "__main__":
-    B, H, M, N, D = 2, 8, 64, 2048, 8
-
-    device = torch.device(0)
-    dtype = torch.float32
-
-    dtype = torch.float16
-    dtype = torch.bfloat16
-
-    cublas_warmup(device)
-    benchmark(B, H, M, N, D, device, dtype, verbose=False)
-    benchmark(B, H, M, N, D, device, dtype, verbose=True)
-
-    exit()
 #

@@ -61,7 +61,7 @@ def collect_data():
                 'num_blocks': config.get('num_blocks'),
                 'num_heads': config.get('num_heads'),
                 'num_layers_kv_proj': config.get('num_layers_kv_proj'),
-                'num_layers_mlp': config.get('num_layers_mlp'),
+                'num_layers_ffn': config.get('num_layers_ffn'),
                 'num_layers_in_out_proj': config.get('num_layers_in_out_proj'),
                 'seed': config.get('seed'),
             })

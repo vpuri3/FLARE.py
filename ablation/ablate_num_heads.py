@@ -25,7 +25,11 @@ os.makedirs(CASEDIR, exist_ok=True)
 
 #======================================================================#
 def collect_data(dataset: str):
-    data_dir = os.path.join(CASEDIR, f'abl_num_heads_{dataset}')
+    # Check both possible locations for backward compatibility
+    data_dir = os.path.join(CASEDIR, 'abl', f'abl_num_heads_{dataset}')
+    if not os.path.exists(data_dir):
+        # Fallback to old location
+        data_dir = os.path.join(CASEDIR, f'abl_num_heads_{dataset}')
 
     # Initialize empty dataframe
     df = pd.DataFrame()
@@ -67,7 +71,7 @@ def collect_data(dataset: str):
                     'num_blocks': config.get('num_blocks'),
                     'num_heads': config.get('num_heads'),
                     'num_layers_kv_proj': config.get('num_layers_kv_proj'),
-                    'num_layers_mlp': config.get('num_layers_mlp'),
+                    'num_layers_ffn': config.get('num_layers_ffn'),
                     'num_layers_in_out_proj': config.get('num_layers_in_out_proj'),
                     'seed': config.get('seed'),
                 })
@@ -91,6 +95,22 @@ def collect_data(dataset: str):
 def plot_results(dataset: str, df: pd.DataFrame):
 
     #---------------------------------------------------------#
+    # Validate DataFrame has required columns
+    required_columns = ['num_latents', 'num_heads', 'test_rel_error']
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    
+    if len(df) == 0:
+        print(f"ERROR: No data collected for dataset '{dataset}'. Cannot plot results.")
+        print(f"Checked data directories:")
+        print(f"  1. {os.path.join(CASEDIR, 'abl', f'abl_num_heads_{dataset}')}")
+        print(f"  2. {os.path.join(CASEDIR, f'abl_num_heads_{dataset}')}")
+        return
+    
+    if missing_columns:
+        print(f"ERROR: DataFrame is missing required columns: {missing_columns}")
+        print(f"Available columns: {df.columns.tolist()}")
+        return
+    
     df = df.groupby(['num_latents', 'num_heads']).mean().reset_index()
 
     configs = df[['num_latents',]].drop_duplicates()
@@ -109,8 +129,8 @@ def plot_results(dataset: str, df: pd.DataFrame):
         "text.latex.preamble": r"\usepackage{amsmath}"
     })
 
-    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
-    fontsize = 28
+    fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+    fontsize = 16
 
     ax.set_ylabel(r'Test relative error', fontsize=fontsize)
 
@@ -208,9 +228,13 @@ def add_job_to_queue(
     epochs: int = 500, batch_size: int = 2, weight_decay: float = 1e-5):
 
     exp_name = f'abl_num_heads_{dataset}_M_{str(num_latents)}_H_{str(num_heads)}_seed_{str(seed)}'
-    exp_name = os.path.join(f'abl_num_heads_{dataset}', exp_name)
+    exp_name_base = os.path.join(f'abl_num_heads_{dataset}', exp_name)
 
-    case_dir = os.path.join(CASEDIR, exp_name)
+    # Check both possible locations
+    case_dir = os.path.join(CASEDIR, 'abl', exp_name_base)
+    if not os.path.exists(case_dir):
+        case_dir = os.path.join(CASEDIR, exp_name_base)
+    
     if os.path.exists(case_dir):
         if os.path.exists(os.path.join(case_dir, 'ckpt10', 'rel_error.json')):
             print(f"Experiment {exp_name} exists. Skipping.")
@@ -230,14 +254,14 @@ def add_job_to_queue(
         'weight_decay': weight_decay,
         'mixed_precision': False,
         #
-        'model_type': 2,
+        'model_type': 'flare_ablations',
         #
         'num_blocks': 8,
         'channel_dim': 64,
         'num_heads': num_heads,
         'num_latents': num_latents,
         'num_layers_kv_proj': 3,
-        'num_layers_mlp': 3,
+        'num_layers_ffn': 3,
         'num_layers_in_out_proj': 2,
     })
 
@@ -245,7 +269,10 @@ def add_job_to_queue(
 
 #======================================================================#
 def clean_results(dataset: str):
-    output_dir = os.path.join(CASEDIR, f'abl_num_heads_{dataset}')
+    # Check both possible locations
+    output_dir = os.path.join(CASEDIR, 'abl', f'abl_num_heads_{dataset}')
+    if not os.path.exists(output_dir):
+        output_dir = os.path.join(CASEDIR, f'abl_num_heads_{dataset}')
     for case_name in [d for d in os.listdir(output_dir) if os.path.isdir(os.path.join(output_dir, d))]:
         case_dir = os.path.join(output_dir, case_name)
         if os.path.exists(os.path.join(case_dir, 'ckpt10', 'rel_error.json')):
@@ -261,15 +288,25 @@ def clean_results(dataset: str):
 #======================================================================#
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Latent Cross Attention model ablation study')
+    
+    def str_to_bool(v):
+        if isinstance(v, bool):
+            return v
+        if v.lower() in ('yes', 'true', 't', 'y', '1'):
+            return True
+        elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+            return False
+        else:
+            raise argparse.ArgumentTypeError('Boolean value expected.')
 
-    parser.add_argument('--eval', type=bool, default=False, help='Evaluate ablation study results')
-    parser.add_argument('--train', type=bool, default=False, help='Train ablation study')
-    parser.add_argument('--clean', type=bool, default=False, help='Clean ablation study results')
+    parser.add_argument('--eval', type=str_to_bool, default=False, help='Evaluate ablation study results')
+    parser.add_argument('--train', type=str_to_bool, default=False, help='Train ablation study')
+    parser.add_argument('--clean', type=str_to_bool, default=False, help='Clean ablation study results')
 
     parser.add_argument('--dataset', type=str, default='elasticity', help='Dataset to use')
     parser.add_argument('--gpu-count', type=int, default=None, help='Number of GPUs to use')
     parser.add_argument('--max-jobs-per-gpu', type=int, default=2, help='Maximum number of jobs per GPU')
-    parser.add_argument('--reverse-queue', type=bool, default=False, help='Reverse queue')
+    parser.add_argument('--reverse-queue', type=str_to_bool, default=False, help='Reverse queue')
 
     args = parser.parse_args()
 

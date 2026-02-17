@@ -9,8 +9,8 @@ __all__ = [
     "BigFLAREModel",
 ]
 
-from .flare import ResidualMLP, FinalLayer
-from .transformer import SelfAttentionBlock
+from .flare import ResidualMLP
+from lra.models.backends import SelfAttentionBlock
 
 #======================================================================#
 # BigFLARE
@@ -185,6 +185,38 @@ class BigFLAREBlock(nn.Module):
         x = x + self.mlp(self.ln2(x))
 
         return x, scores
+
+#======================================================================#
+# Final Layer
+#======================================================================#
+class FinalLayer(nn.Module):
+    def __init__(
+        self,
+        channel_dim: int,
+        out_dim: int,
+        act: str = None,
+        num_layers: int = 2,
+        hidden_dim: int = None,
+        ln: bool = True,
+    ):
+        if hidden_dim is None:
+            hidden_dim = channel_dim
+
+        super().__init__()
+        self.ln = nn.LayerNorm(channel_dim) if ln else nn.Identity()
+        self.mlp = ResidualMLP(
+            in_dim=channel_dim,
+            hidden_dim=hidden_dim,
+            out_dim=out_dim,
+            num_layers=num_layers,
+            act=act,
+            input_residual=True,
+            output_residual=False,
+        )
+
+    def forward(self, x):
+        x = self.mlp(self.ln(x))
+        return x
 
 #======================================================================#
 # MODEL

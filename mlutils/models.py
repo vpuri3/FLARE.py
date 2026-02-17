@@ -22,7 +22,7 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         x, gates = x.chunk(2, dim=-1)
         return x * F.silu(gates)
-    
+
 class GEGLU(nn.Module):
     def forward(self, x):
         if check_package_version_lteq('torch', '2.4.0'):

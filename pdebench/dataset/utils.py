@@ -4,11 +4,8 @@ import copy
 import json
 import numpy as np
 import torch
-import torch_geometric as pyg
 from tqdm import tqdm
 from torch.utils.data import TensorDataset, Subset
-import datasets
-import huggingface_hub
 
 import pdebench
 from mlutils import check_package_version_lteq
@@ -31,6 +28,7 @@ def load_dataset(
         init_step: int = None,
         init_case: int = None,
         exclude: bool = True,
+        train_rollout_noise: float = 0.
     ):
     """Load a dataset by name.
     
@@ -69,10 +67,81 @@ def load_dataset(
             c_in=2,
             c_out=1,
             time_cond=False,
+            max_length=972,
         )
 
         return train_data, test_data, metadata
 
+    elif dataset_name == 'plasticity':
+        import scipy.io as scio
+
+        DATADIR = os.path.join(DATADIR_BASE, 'Geo-FNO', 'plasticity')
+        data_path = os.path.join(DATADIR, 'plas_N987_T20.mat')
+        
+        N = 987
+        ntrain = 900
+        ntest = 80
+
+        s1 = 101
+        s2 = 31
+        T = 20
+        Deformation = 4
+
+        r1 = 1
+        r2 = 1
+        s1 = int(((s1 - 1) / r1) + 1)
+        s2 = int(((s2 - 1) / r2) + 1)
+
+        data = scio.loadmat(data_path)
+        input = torch.tensor(data['input'], dtype=torch.float)
+        output = torch.tensor(data['output'], dtype=torch.float).transpose(-2, -1)
+        x_train = input[:ntrain, ::r1][:, :s1].reshape(ntrain, s1, 1).repeat(1, 1, s2)
+        x_train = x_train.reshape(ntrain, -1, 1)
+        y_train = output[:ntrain, ::r1, ::r2][:, :s1, :s2]
+        y_train = y_train.reshape(ntrain, -1, Deformation, T)
+        x_test = input[-ntest:, ::r1][:, :s1].reshape(ntest, s1, 1).repeat(1, 1, s2)
+        x_test = x_test.reshape(ntest, -1, 1)
+        y_test = output[-ntest:, ::r1, ::r2][:, :s1, :s2]
+        y_test = y_test.reshape(ntest, -1, Deformation, T)
+
+        x_normalizer = pdebench.UnitGaussianNormalizer(x_train)
+        x_train = x_normalizer.encode(x_train)
+        x_test = x_normalizer.encode(x_test)
+
+        x = np.linspace(0, 1, s1)
+        y = np.linspace(0, 1, s2)
+        x, y = np.meshgrid(x, y)
+        pos = np.c_[x.ravel(), y.ravel()]
+        pos = torch.tensor(pos, dtype=torch.float).unsqueeze(0)
+
+        pos_train = pos.repeat(ntrain, 1, 1)
+        pos_test = pos.repeat(ntest, 1, 1)
+
+        t = np.linspace(0, 1, T)
+        t = torch.tensor(t, dtype=torch.float).unsqueeze(0)
+        t_train = t.repeat(ntrain, 1)
+        t_test = t.repeat(ntest, 1)
+        
+        print(pos_train.shape, t_train.shape, x_train.shape, y_train.shape)
+        exit()
+
+        train_data = TensorDataset(pos_train, t_train, x_train, y_train)
+        test_data  = TensorDataset(pos_test, t_test, x_test, y_test)
+        
+        # collate_fn = random_collate_fn
+
+        metadata = dict(
+            x_normalizer=x_normalizer,
+            y_normalizer=y_normalizer,
+            c_in=0,
+            c_out=0,
+            time_cond=False,
+            H=s1,
+            W=s2,
+        )
+        
+        return train_data, test_data, metadata
+        
     elif dataset_name == 'pipe':
         DATADIR = os.path.join(DATADIR_BASE, 'Geo-FNO', 'pipe')
         
@@ -128,6 +197,7 @@ def load_dataset(
             time_cond=False,
             H=s1,
             W=s2,
+            max_length=s1 * s2,
         )
 
         return train_data, test_data, metadata
@@ -189,6 +259,7 @@ def load_dataset(
             time_cond=False,
             H=s1,
             W=s2,
+            max_length=s1 * s2,
         )
         
         return train_data, test_data, metadata
@@ -201,15 +272,32 @@ def load_dataset(
 
         DATADIR = os.path.join(DATADIR_BASE, 'FNO', 'darcy')
 
+        #------------------------------------#
+        # Transolver
+        #------------------------------------#
         train_path = os.path.join(DATADIR, 'piececonst_r421_N1024_smooth1.mat')
         test_path = os.path.join(DATADIR, 'piececonst_r421_N1024_smooth2.mat')
         ntrain = 1000
         ntest = 200
-        
+
         r = 5 # downsample
         h = int(((421 - 1) / r) + 1)
         s = h
         dx = 1.0 / s
+
+        # #------------------------------------#
+        # # LNO: https://github.com/L-I-M-I-T/LatentNeuralOperator/pull/6/files
+        # #------------------------------------#
+        # train_path = os.path.join(DATADIR, 'piececonst_r241_N1024_smooth1.mat')
+        # test_path = os.path.join(DATADIR, 'piececonst_r241_N1024_smooth2.mat')
+        # ntrain = 1000
+        # ntest = 200
+
+        # r = 1 # downsample
+        # h = int(((241 - 1) / r) + 1)
+        # s = h
+        # dx = 1.0 / s
+        # #------------------------------------#
 
         train_data = scio.loadmat(train_path)
         x_train = train_data['coeff'][:ntrain, ::r, ::r][:, :s, :s]
@@ -264,10 +352,204 @@ def load_dataset(
             time_cond=False,
             H=s,
             W=s,
+            max_length=s * s,
         )
 
         return train_data, test_data, metadata
 
+    elif dataset_name == 'navier_stokes':
+        import scipy.io as scio
+
+        DATADIR = os.path.join(DATADIR_BASE, 'FNO', 'navier_stokes')
+        data_path = os.path.join(DATADIR, 'NavierStokes_V1e-5_N1200_T20.mat')
+
+        r = 1
+        h = int(((64 - 1) / r) + 1)
+        ntrain = 1000
+        ntest = 200
+        T_in = 10
+        T = 10
+
+        data = scio.loadmat(data_path)
+        train_a = data['u'][:ntrain, ::r, ::r, :T_in][:, :h, :h, :]
+        train_a = train_a.reshape(train_a.shape[0], -1, train_a.shape[-1])
+        train_a = torch.from_numpy(train_a)
+        train_u = data['u'][:ntrain, ::r, ::r, T_in:T + T_in][:, :h, :h, :]
+        train_u = train_u.reshape(train_u.shape[0], -1, train_u.shape[-1])
+        train_u = torch.from_numpy(train_u)
+
+        test_a = data['u'][-ntest:, ::r, ::r, :T_in][:, :h, :h, :]
+        test_a = test_a.reshape(test_a.shape[0], -1, test_a.shape[-1])
+        test_a = torch.from_numpy(test_a)
+        test_u = data['u'][-ntest:, ::r, ::r, T_in:T + T_in][:, :h, :h, :]
+        test_u = test_u.reshape(test_u.shape[0], -1, test_u.shape[-1])
+        test_u = torch.from_numpy(test_u)
+
+        x = np.linspace(0, 1, h)
+        y = np.linspace(0, 1, h)
+        x, y = np.meshgrid(x, y)
+        pos = np.c_[x.ravel(), y.ravel()]
+        pos = torch.tensor(pos, dtype=torch.float).unsqueeze(0)
+        pos_train = pos.repeat(ntrain, 1, 1)
+        pos_test = pos.repeat(ntest, 1, 1)
+
+        # print(pos_train.shape) # [1000, 4096,  2]
+        # print(train_a.shape)   # [1000, 4096, 10]
+        # print(train_u.shape)   # [1000, 4096, 10]
+
+        # train_input = torch.cat([pos_train, train_a], dim=-1)
+        # test_input  = torch.cat([pos_test , test_a ], dim=-1)
+
+        # train_output = train_u
+        # test_output  = test_u
+
+        # train_dataset = TensorDataset(train_input, train_output)
+        # test_dataset  = TensorDataset(test_input , test_output )
+
+        train_dataset = TensorDataset(pos_train, train_a, train_u)
+        test_dataset  = TensorDataset(pos_test , test_a , test_u )
+
+        metadata = dict(
+            x_normalizer=pdebench.IdentityNormalizer(),
+            y_normalizer=pdebench.IdentityNormalizer(),
+            c_in=12,
+            c_out=1,
+            time_cond=False,
+            H=h,
+            W=h,
+            max_length=h * h,
+        )
+
+        return train_dataset, test_dataset, metadata
+        
+    #----------------------------------------------------------------#
+    # MeshGraphNets datasets
+    #----------------------------------------------------------------#
+    elif dataset_name in ['airfoil_dynamic', 'cylinder_flow']:
+
+        from pdebench.dataset.timeseries import TimeseriesDataset, TimeseriesDatasetTransform
+
+        force_reload = False
+        max_cases = 10
+        max_steps = 500
+        init_step = 100
+        init_case = 0
+        exclude = True
+
+        DATADIR = os.path.join(DATADIR_BASE, 'MeshGraphNets', dataset_name)
+        transform_kwargs = dict(mesh=mesh, cells=cells)
+
+        dataset_kwargs = dict(
+            force_reload=force_reload,
+            max_cases=max_cases,
+            max_steps=max_steps,
+            init_step=init_step,
+        )
+
+        train_transform = TimeseriesDatasetTransform(dataset_name, **transform_kwargs)
+        test_transform  = TimeseriesDatasetTransform(dataset_name, **transform_kwargs)
+
+        train_dataset = TimeseriesDataset(DATADIR, PROJDIR, 'train', transform=train_transform, **dataset_kwargs, init_case=init_case, exclude=exclude)
+        test_dataset  = TimeseriesDataset(DATADIR, PROJDIR, 'test' , transform=test_transform , **dataset_kwargs, exclude=exclude)
+
+        test_dataset.transform.apply_normalization_stats(train_dataset.norm_stats)
+
+        # Looks like there is some disparity bw train_dataset and test_dataset
+        train_dataset, test_dataset = split_timeseries_dataset(train_dataset, split=[0.8, 0.2])
+
+        metadata = dict(
+            x_normalizer=pdebench.IdentityNormalizer(),
+            y_normalizer=pdebench.IdentityNormalizer(),
+            c_in=11,
+            c_edge=2,
+            c_out=2,
+            time_cond=True,
+        )
+
+        if GLOBAL_RANK == 0:
+            print(f"Loaded {dataset_name} dataset with {train_dataset.num_cases} train and {test_dataset.num_cases} test cases.")
+            print(f"Number of time-steps: {train_dataset.trajectory_length}")
+
+            if max_steps is not None:
+                print(f"Limiting to {max_steps} time-steps")
+            if max_cases is not None:
+                print(f"Limiting to {max_cases} cases")
+
+            for graph in train_dataset:
+                print(graph)
+                break
+
+        return train_dataset, test_dataset, metadata
+
+    #----------------------------------------------------------------#
+    # ShapeNet-Car datasets
+    #----------------------------------------------------------------#
+    elif dataset_name == 'shapenet_car':
+        import meshio
+        from pathlib import Path
+
+        SRC = os.path.join(DATADIR_BASE, 'ShapeNet-Car', 'mlcfd_data', 'training_data')
+        DST = os.path.join(DATADIR_BASE, 'ShapeNet-Car', 'preprocessed')
+    
+        SRC = Path(SRC).expanduser()
+        DST = Path(DST).expanduser()
+
+        uris = []
+        for i in range(9):
+            param_uri = SRC / f"param{i}"
+            for name in sorted(os.listdir(param_uri)):
+                # param folders contain .npy/.py/txt files
+                if "." in name:
+                    continue
+                potential_uri = param_uri / name
+                assert os.path.isdir(potential_uri)
+                uris.append(potential_uri)
+        print(f"found {len(uris)} samples")
+
+        # Preprocessing
+        if DST.exists() and all((DST / uri.relative_to(SRC)).exists() for uri in uris):
+            print("Preprocessed files already exist, skipping processing")
+        else:
+            # .vtk files contains points that dont belong to the mesh -> filter them out
+            mesh_point_counts = []
+            for uri in tqdm(uris):
+                reluri = uri.relative_to(SRC)
+                out = DST / reluri
+                out.mkdir(exist_ok=True, parents=True)
+
+                # filter out mesh points that are not part of the shape
+                mesh = meshio.read(uri / "quadpress_smpl.vtk")
+                assert len(mesh.cells) == 1
+                cell_block = mesh.cells[0]
+                assert cell_block.type == "quad"
+                unique = np.unique(cell_block.data)
+                mesh_point_counts.append(len(unique))
+                mesh_points = torch.from_numpy(mesh.points[unique]).float()
+                pressure = torch.from_numpy(np.load(uri / "press.npy", mmap_mode='r')[unique]).float()
+                torch.save(mesh_points, out / "mesh_points.th")
+                torch.save(pressure, out / "pressure.th")
+
+                # generate sdf
+                for resolution in [32, 40, 48, 64, 80]:
+                    torch.save(sdf(mesh, resolution=resolution), out / f"sdf_res{resolution}.th")
+
+        train_dataset = ShapeNetCarDataset(DST, split='train')
+        test_dataset  = ShapeNetCarDataset(DST, split='test')
+
+        metadata = dict(
+            x_normalizer=pdebench.IdentityNormalizer(),
+            y_normalizer=pdebench.UnitGaussianNormalizer(torch.rand(10,1)),
+            c_in=3,
+            c_out=1,
+            time_cond=False,
+            max_length=20_000,
+        )
+
+        metadata['y_normalizer'].mean = train_dataset.pressure_mean
+        metadata['y_normalizer'].std  = train_dataset.pressure_std
+
+        return train_dataset, test_dataset, metadata
+        
     #----------------------------------------------------------------#
     # DrivAerML DATASET
     #----------------------------------------------------------------#
@@ -300,6 +582,7 @@ def load_dataset(
             c_in=3,
             c_out=1,
             time_cond=False,
+            max_length=num_points,
         )
 
         metadata['y_normalizer'].mean = torch.tensor(train_dataset.p_mean)
@@ -315,8 +598,8 @@ def load_dataset(
 
         transform = am.FinaltimeDatasetTransform(disp=True, vmstr=False, mesh=False)
 
-        train_dataset = LPBFDataset(split='train', transform=transform)
-        test_dataset  = LPBFDataset(split='test', transform=transform)
+        train_dataset = create_lpbf_dataset(split='train', transform=transform)
+        test_dataset  = create_lpbf_dataset(split='test', transform=transform)
 
         mean_disp = 0.
         std_disp  = 0.
@@ -340,6 +623,7 @@ def load_dataset(
             c_edge=3,
             c_out=1,
             time_cond=False,
+            max_length=50_000,
         )
 
         return train_dataset, test_dataset, metadata
@@ -418,6 +702,87 @@ def sdf(mesh, resolution):
     grid = np.stack(np.meshgrid(tx, ty, tz, indexing="ij"), axis=-1).astype(np.float32)
     return torch.from_numpy(scene.compute_signed_distance(grid).numpy()).float()
 
+class ShapeNetCarDataset(torch.utils.data.Dataset):
+    # from https://github.com/ml-jku/UPT/blob/main/src/datasets/shapenet_car.py
+    # generated with torch.randperm(889, generator=torch.Generator().manual_seed(0))[:189]
+    TEST_INDICES = {
+        550, 592, 229, 547, 62, 464, 798, 836, 5, 732, 876, 843, 367, 496,
+        142, 87, 88, 101, 303, 352, 517, 8, 462, 123, 348, 714, 384, 190,
+        505, 349, 174, 805, 156, 417, 764, 788, 645, 108, 829, 227, 555, 412,
+        854, 21, 55, 210, 188, 274, 646, 320, 4, 344, 525, 118, 385, 669,
+        113, 387, 222, 786, 515, 407, 14, 821, 239, 773, 474, 725, 620, 401,
+        546, 512, 837, 353, 537, 770, 41, 81, 664, 699, 373, 632, 411, 212,
+        678, 528, 120, 644, 500, 767, 790, 16, 316, 259, 134, 531, 479, 356,
+        641, 98, 294, 96, 318, 808, 663, 447, 445, 758, 656, 177, 734, 623,
+        216, 189, 133, 427, 745, 72, 257, 73, 341, 584, 346, 840, 182, 333,
+        218, 602, 99, 140, 809, 878, 658, 779, 65, 708, 84, 653, 542, 111,
+        129, 676, 163, 203, 250, 209, 11, 508, 671, 628, 112, 317, 114, 15,
+        723, 746, 765, 720, 828, 662, 665, 399, 162, 495, 135, 121, 181, 615,
+        518, 749, 155, 363, 195, 551, 650, 877, 116, 38, 338, 849, 334, 109,
+        580, 523, 631, 713, 607, 651, 168,
+    }
+
+    def __init__(self, datadir, split='train', resolution=None, transform=None):
+        super().__init__()
+        self.datadir = datadir
+        self.split = split
+        self.resolution = resolution
+        self.transform = transform
+
+        # define spatial min/max of simulation for normalizing to [0, 1]
+        # min: [-1.7978, -0.7189, -4.2762]
+        # max: [1.8168, 4.3014, 5.8759]
+        self.domain_min = torch.tensor([-2.0, -1.0, -4.5])
+        self.domain_max = torch.tensor([2.0, 4.5, 6.0])
+
+        # mean/std for normalization (calculated on the 700 train samples)
+        # import torch
+        # from datasets.shapenet_car import ShapenetCar
+        # ds = ShapenetCar(global_root="/local00/bioinf/shapenet_car", split="train")
+        # targets = [ds.getitem_pressure(i) for i in range(len(ds))]
+        # targets = torch.stack(targets)
+        # targets.mean()
+        # targets.std()
+        self.pressure_mean = torch.tensor(-36.3099)
+        self.pressure_std  = torch.tensor( 48.5743)
+
+        # discover uris
+        self.uris = []
+        for i in range(9):
+            param_uri = self.datadir / f"param{i}"
+            for name in sorted(os.listdir(param_uri)):
+                sample_uri = param_uri / name
+                if sample_uri.is_dir():
+                    self.uris.append(sample_uri)
+        assert len(self.uris) == 889, f"found {len(self.uris)} uris instead of 889"
+        # split into train/test uris
+        if split == 'train':
+            train_idxs = [i for i in range(len(self.uris)) if i not in self.TEST_INDICES]
+            self.uris = [self.uris[train_idx] for train_idx in train_idxs]
+            assert len(self.uris) == 700
+        elif split == 'test':
+            self.uris = [self.uris[test_idx] for test_idx in self.TEST_INDICES]
+            assert len(self.uris) == 189
+        else:
+            raise NotImplementedError
+
+    def __len__(self):
+        return len(self.uris)
+
+    def __getitem__(self, idx):
+        uri = self.uris[idx]
+        if check_package_version_lteq('torch', '2.4'):
+            pressure = torch.load(uri / "pressure.th")
+            mesh_points = torch.load(uri / "mesh_points.th")
+        else:
+            pressure = torch.load(uri / "pressure.th", weights_only=True)
+            mesh_points = torch.load(uri / "mesh_points.th", weights_only=True)
+
+        pressure = (pressure - self.pressure_mean) / self.pressure_std
+        mesh_points = (mesh_points - self.domain_min) / (self.domain_max - self.domain_min)
+
+        return mesh_points.view(-1, 3), pressure.view(-1, 1)
+
 #======================================================================#
 class DrivAerMLDataset(torch.utils.data.Dataset):
     def __init__(self, data_dir_base, split):
@@ -456,73 +821,80 @@ class DrivAerMLDataset(torch.utils.data.Dataset):
         return x, p
 
 #======================================================================#
-# AM STEADY (LPBF) DATASET
+# LPBF DATASET
 #======================================================================#
-class LPBFDataset(pyg.data.Dataset):
-    def __init__(self, split='train', transform=None):
-        assert split in ['train', 'test'], f"Invalid split: {split}. Must be one of: 'train', 'test'."
+def create_lpbf_dataset(*args, **kwargs):
 
-        self.repo_id = 'vedantpuri/LPBF_FLARE'
-        
-        print(f"Initializing {split} dataset...")
-        
-        # Fast initialization: Load dataset index first (lightweight)
-        import time
-        start_time = time.time()
-        self.dataset = datasets.load_dataset(self.repo_id, split=split, keep_in_memory=True)
-        dataset_time = time.time() - start_time
-        print(f"Dataset index load: {dataset_time:.2f}s")
+    import torch_geometric as pyg
+    import datasets, huggingface_hub
 
-        # Lazy cache initialization - only download when needed
-        self._cache_dir = None
-        
-        print(f"✅ Loaded {len(self.dataset)} samples for {split} split")
+    class LPBFDataset(pyg.data.Dataset):
+        def __init__(self, split='train', transform=None):
+            assert split in ['train', 'test'], f"Invalid split: {split}. Must be one of: 'train', 'test'."
 
-        super().__init__(None, transform=transform)
-    
-    @property
-    def cache_dir(self):
-        """Lazy loading of cache directory - only download when first sample is accessed."""
-        if self._cache_dir is None:
-            print("Downloading repository files on first access...")
+            self.repo_id = 'vedantpuri/LPBF_FLARE'
+            
+            print(f"Initializing {split} dataset...")
+            
+            # Fast initialization: Load dataset index first (lightweight)
             import time
             start_time = time.time()
-            self._cache_dir = huggingface_hub.snapshot_download(self.repo_id, repo_type="dataset")
-            download_time = time.time() - start_time
-            print(f"Repository download/cache: {download_time:.2f}s")
-            print(f"Cache directory: {self._cache_dir}")
-        return self._cache_dir
+            self.dataset = datasets.load_dataset(self.repo_id, split=split, keep_in_memory=True)
+            dataset_time = time.time() - start_time
+            print(f"Dataset index load: {dataset_time:.2f}s")
 
-    def len(self):
-        return len(self.dataset)
+            # Lazy cache initialization - only download when needed
+            self._cache_dir = None
+            
+            print(f"✅ Loaded {len(self.dataset)} samples for {split} split")
 
-    def get(self, idx):
-        # Get file path from index
-        entry = self.dataset[idx]
-        rel_path = entry["file"]
-        npz_path = os.path.join(self.cache_dir, rel_path)
+            super().__init__(None, transform=transform)
 
-        # Load NPZ file (main bottleneck check)
-        data = np.load(npz_path, allow_pickle=True)
-        graph = pyg.data.Data()
+        @property
+        def cache_dir(self):
+            """Lazy loading of cache directory - only download when first sample is accessed."""
+            if self._cache_dir is None:
+                print("Downloading repository files on first access...")
+                import time
+                start_time = time.time()
+                self._cache_dir = huggingface_hub.snapshot_download(self.repo_id, repo_type="dataset")
+                download_time = time.time() - start_time
+                print(f"Repository download/cache: {download_time:.2f}s")
+                print(f"Cache directory: {self._cache_dir}")
+            return self._cache_dir
 
-        # Convert to tensors efficiently
-        for key, value in data.items():
-            if key == "_metadata":
-                graph["metadata"] = json.loads(value[0])["metadata"]
-            else:
-                # Use torch.from_numpy for faster conversion when possible
-                if value.dtype.kind == "f":
-                    tensor = torch.from_numpy(value.astype(np.float32))
+        def len(self):
+            return len(self.dataset)
+
+        def get(self, idx):
+            # Get file path from index
+            entry = self.dataset[idx]
+            rel_path = entry["file"]
+            npz_path = os.path.join(self.cache_dir, rel_path)
+
+            # Load NPZ file (main bottleneck check)
+            data = np.load(npz_path, allow_pickle=True)
+            graph = pyg.data.Data()
+
+            # Convert to tensors efficiently
+            for key, value in data.items():
+                if key == "_metadata":
+                    graph["metadata"] = json.loads(value[0])["metadata"]
                 else:
-                    tensor = torch.from_numpy(value.astype(np.int64)) if value.dtype != np.int64 else torch.from_numpy(value)
-                graph[key] = tensor
+                    # Use torch.from_numpy for faster conversion when possible
+                    if value.dtype.kind == "f":
+                        tensor = torch.from_numpy(value.astype(np.float32))
+                    else:
+                        tensor = torch.from_numpy(value.astype(np.int64)) if value.dtype != np.int64 else torch.from_numpy(value)
+                    graph[key] = tensor
 
-        # Set standard attributes
-        graph.x = graph.pos
-        graph.y = graph.disp[:, 2]
+            # Set standard attributes
+            graph.x = graph.pos
+            graph.y = graph.disp[:, 2]
 
-        return graph
+            return graph
+        
+    return LPBFDataset(*args, **kwargs)
 
 #======================================================================#
 #

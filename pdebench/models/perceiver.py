@@ -10,8 +10,96 @@ __all__ = [
 ]
 
 # local
-from .transformer import SelfAttentionBlock, MLPBlock
-from .flare import ResidualMLP, FinalLayer
+from .flare import ResidualMLP
+
+#======================================================================#
+# Local blocks (self-contained Perceiver dependencies)
+#======================================================================#
+ACTIVATIONS = {
+    'gelu': nn.GELU(approximate='tanh'),
+    'silu': nn.SiLU(),
+}
+
+class MLPBlock(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, act: str = None):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.act = ACTIVATIONS[act] if act else ACTIVATIONS['gelu']
+        self.fc2 = nn.Linear(hidden_dim, out_dim)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        return x
+
+class MultiHeadedSelfAttention(nn.Module):
+    def __init__(self, channel_dim: int, num_heads: int = None):
+        super().__init__()
+        self.channel_dim = channel_dim
+        self.num_heads = channel_dim // 16 if num_heads is None else num_heads
+        self.head_dim = self.channel_dim // self.num_heads
+        self.scale = self.head_dim ** -0.5
+        assert self.channel_dim % self.num_heads == 0, (
+            f"channel_dim must be divisible by num_heads. Got {self.channel_dim} and {self.num_heads}."
+        )
+
+        self.qkv_proj = nn.Linear(self.channel_dim, 3 * self.channel_dim, bias=False)
+        self.out_proj = nn.Linear(self.channel_dim, self.channel_dim)
+
+    def forward(self, x):
+        q, k, v = self.qkv_proj(x).chunk(3, dim=-1)
+        q, k, v = [rearrange(z, 'b n (h d) -> b h n d', h=self.num_heads) for z in [q, k, v]]
+        y = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        y = rearrange(y, 'b h n d -> b n (h d)')
+        y = self.out_proj(y)
+        return y
+
+class SelfAttentionBlock(nn.Module):
+    def __init__(self, channel_dim: int, num_heads: int = None, mlp_ratio: float = 4.0, act: str = None):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(channel_dim)
+        self.ln2 = nn.LayerNorm(channel_dim)
+        self.att = MultiHeadedSelfAttention(channel_dim, num_heads)
+        self.mlp = MLPBlock(
+            in_dim=channel_dim,
+            hidden_dim=int(channel_dim * mlp_ratio),
+            out_dim=channel_dim,
+            act=act,
+        )
+
+    def forward(self, x):
+        x = x + self.att(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+class FinalLayer(nn.Module):
+    def __init__(
+        self,
+        channel_dim: int,
+        out_dim: int,
+        act: str = None,
+        num_layers: int = 2,
+        hidden_dim: int = None,
+        ln: bool = True,
+    ):
+        if hidden_dim is None:
+            hidden_dim = channel_dim
+        super().__init__()
+        self.ln = nn.LayerNorm(channel_dim) if ln else nn.Identity()
+        self.mlp = ResidualMLP(
+            in_dim=channel_dim,
+            hidden_dim=hidden_dim,
+            out_dim=out_dim,
+            num_layers=num_layers,
+            act=act,
+            input_residual=True,
+            output_residual=False,
+        )
+
+    def forward(self, x):
+        x = self.mlp(self.ln(x))
+        return x
 
 #======================================================================#
 # Perceiver Encoder/ Decoder

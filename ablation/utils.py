@@ -36,7 +36,7 @@ def run_jobs(
             for p in active_processes[i]:
                 if p.poll() is not None:
                     if p.returncode != 0:
-                        print(f"\nExperiment {p.args[4]} failed on GPU {i}. Removing and re-running.")
+                        print(f"\nExperiment {p.args[6]} failed on GPU {i}. Removing and re-running.")
                         # remove failed experiment and re-run
                         case_dir = os.path.join('.', 'out', 'pdebench', p.args[6])
                         shutil.rmtree(case_dir)
@@ -53,12 +53,14 @@ def run_jobs(
             os.environ['CUDA_VISIBLE_DEVICES'] = str(gpuid)
 
             job = job_queue.pop(0)
+            model_type = job['model_type']
+            num_layers_ffn = job['num_layers_ffn']
             process = subprocess.Popen(
                 [
                     'uv', 'run', 'python', '-m', 'pdebench',
                     '--exp_name', str(job['exp_name']),
                     '--train', str('True'),
-                    '--model_type', str(2),
+                    '--model_type', str(model_type),
                     '--dataset', str(dataset),
                     '--seed', str(job['seed']),
                     # training arguments
@@ -71,7 +73,7 @@ def run_jobs(
                     '--num_blocks', str(job['num_blocks']),
                     '--num_heads', str(job['num_heads']),
                     '--num_layers_kv_proj', str(job['num_layers_kv_proj']),
-                    '--num_layers_mlp', str(job['num_layers_mlp']),
+                    '--num_layers_ffn', str(num_layers_ffn),
                     '--num_layers_in_out_proj', str(job['num_layers_in_out_proj']),
                 ],
                 stdout=subprocess.DEVNULL,

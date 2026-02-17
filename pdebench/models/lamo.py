@@ -17,8 +17,8 @@ __all__ = [
 ACTIVATION = {'gelu': nn.GELU, 'tanh': nn.Tanh, 'sigmoid': nn.Sigmoid, 'relu': nn.ReLU, 'leaky_relu': nn.LeakyReLU(0.1),
               'softplus': nn.Softplus, 'ELU': nn.ELU, 'silu': nn.SiLU}
 
-from pdebench.models.mamba.mamba_2D_v1 import Mamba2
-from pdebench.models.mamba.mamba_2D_v2 import Hydra
+from .mamba.mamba_2D_v1 import Mamba2
+from .mamba.mamba_2D_v2 import Hydra
 
 #======================================================================#
 # Latent SSMs

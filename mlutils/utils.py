@@ -5,10 +5,23 @@ import torch.distributed as dist
 
 import numpy as np
 
+from datetime import timedelta
 import os
 import random
+import pathlib
 
 __all__ = [
+    # cache directory
+    'set_cache_path',
+    'dotdot',
+
+    # Sampler
+    'RepeatBatchSampler',
+
+    # experiment management
+    "get_next_exp_name",
+
+    # device and seed
     "set_seed",
     'set_num_threads',
     "select_device",
@@ -17,19 +30,107 @@ __all__ = [
     'dist_backend',
     'dist_setup',
     'dist_finalize',
+    'get_module',
 
+    # model utility
     "num_parameters",
 
-    "mean_std",
-    "normalize",
-    "unnormalize",
-
+    # statistics
     "r2",
-    
+
     # versioning hell
     'to_numpy',
     'check_package_version_lteq'
 ]
+
+#======================================================================#
+def dotdot(dir: str):
+    # assert os.path.exists(dir), f"Directory {dir} does not exist."
+    return os.path.abspath(os.path.join(dir, '..'))
+
+def set_cache_path(BASE_DIR: str):
+    CACHE_BASE = os.path.join(BASE_DIR, "cache")
+    env_vars = {
+        "PIP_CACHE_DIR": os.path.join(CACHE_BASE, "pip"),
+        "UV_CACHE_DIR": os.path.join(CACHE_BASE, "uv"),
+        "XDG_CACHE_HOME": CACHE_BASE,
+        "TORCH_HOME": os.path.join(CACHE_BASE, "torch"),
+        "WANDB_CACHE_DIR": os.path.join(CACHE_BASE, "wandb"),
+        "TRITON_CACHE_DIR": os.path.join(CACHE_BASE, "triton"),
+        "DATASETS_CACHE": os.path.join(CACHE_BASE, "datasets"),
+        "MPLCONFIGDIR": os.path.join(CACHE_BASE, "matplotlib"),
+        "HF_HOME": os.path.join(CACHE_BASE, "huggingface"),
+        "HUGGINGFACE_HUB_CACHE": os.path.join(CACHE_BASE, "huggingface"),
+        "HF_DATASETS_CACHE": os.path.join(CACHE_BASE, "datasets"),
+        "HF_HUB_CACHE": os.path.join(CACHE_BASE, "huggingface"),
+    }
+
+    for var, path in env_vars.items():
+        os.environ[var] = str(path)
+        pathlib.Path(path).mkdir(parents=True, exist_ok=True)
+
+    return
+
+#======================================================================#
+class RepeatBatchSampler(torch.utils.data.BatchSampler):
+    def __init__(self, batch_sampler: torch.utils.data.BatchSampler, repeat: int):
+        if repeat < 1:
+            raise ValueError(f"repeat must be >= 1. Got {repeat}.")
+        self.batch_sampler = batch_sampler
+        self.repeat = repeat
+
+    def __iter__(self):
+        for batch in self.batch_sampler:
+            for _ in range(self.repeat):
+                yield batch
+
+    def __len__(self):
+        return len(self.batch_sampler) * self.repeat
+
+#=======================================================================#
+def get_next_exp_name(CASEDIR: str, exp_name: str):
+    """
+    Get the next experiment name in the given directory.
+    If the experiment name already exists, it is modified by adding a '_<number>' suffix.
+    If the next number is already taken, the next experiment name is the base name with the next number.
+    This is repeated until a unique experiment name is found.
+    
+    Works with arbitrarily deep paths like "a/b/c/d/e/experiment" by preserving the parent
+    directory structure and only modifying the final directory name.
+
+    Args:
+        CASEDIR: The directory to store the experiments.
+        exp_name: The base name of the experiment (can be a nested path like "path/to/dir").
+
+    Returns:
+        The next experiment name (preserving the full path structure).
+    """
+
+    # Extract the final directory name and parent path
+    # os.path.basename/dirname work correctly with paths of any depth
+    exp_base = os.path.basename(exp_name)  # e.g., "dir" from "a/b/c/dir"
+    exp_parent = os.path.dirname(exp_name)  # e.g., "a/b/c" from "a/b/c/dir"
+    parent_dir = os.path.join(CASEDIR, exp_parent) if exp_parent else CASEDIR
+
+    if not os.path.exists(parent_dir):
+        os.makedirs(parent_dir, exist_ok=True)
+
+    existing_dirs = [d for d in os.listdir(parent_dir) if d.startswith(exp_base)]
+
+    if exp_base in existing_dirs:
+        numbers = [0 if d == exp_base else int(d.split('_')[-1]) 
+                   for d in existing_dirs if d == exp_base or 
+                   (d.startswith(exp_base + '_') and d.split('_')[-1].isdigit())]
+        next_num = max(numbers, default=-1) + 1
+        exp_base_new = f"{exp_base}_{next_num:02d}"
+        exp_name_new = os.path.join(exp_parent, exp_base_new) if exp_parent else exp_base_new
+
+        if exp_base_new in existing_dirs:
+            return get_next_exp_name(CASEDIR, exp_name_new)
+        
+        return exp_name_new
+
+    return exp_name
 
 #=======================================================================#
 def to_numpy(t: torch.Tensor):
@@ -56,14 +157,9 @@ def set_seed(seed = 0):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-    try:
-        torch.set_float32_matmul_precision('high')
-        print(f"Setting float32 matmul precision to high")
-    except:
-        print(f"Could not set float32 matmul precision to high.")
+    torch.backends.cuda.matmul.allow_tf32 = True
 
     return
 
@@ -124,25 +220,24 @@ def dist_setup():
         print(f'using {backend} backend for torch.distributed.')
 
     if is_torchrun():
+        timeout_minutes_env = os.environ.get("MLUTILS_DDP_TIMEOUT_MINUTES", "10")
+        try:
+            timeout_minutes = int(timeout_minutes_env)
+        except ValueError:
+            timeout_minutes = 10
+
         GLOBAL_RANK = int(os.environ["RANK"])
         LOCAL_RANK = int(os.environ["LOCAL_RANK"])
         WORLD_SIZE = int(os.environ["WORLD_SIZE"])
 
         torch.cuda.set_device(LOCAL_RANK)
-
-        if check_package_version_lteq('torch', '2'): # not sure about version
-            dist.init_process_group(
-                backend,
-                rank=GLOBAL_RANK,
-                world_size=WORLD_SIZE,
-            )
-        else:
-            dist.init_process_group(
-                backend=backend,
-                rank=GLOBAL_RANK,
-                world_size=WORLD_SIZE,
-                device_id=torch.device(LOCAL_RANK),
-            )
+        dist.init_process_group(
+            backend=backend,
+            rank=GLOBAL_RANK,
+            world_size=WORLD_SIZE,
+            device_id=torch.device(LOCAL_RANK),
+            timeout=timedelta(minutes=timeout_minutes),
+        )
     else:
         pass
 
@@ -153,27 +248,13 @@ def dist_finalize():
         dist.destroy_process_group()
     return
 
+def get_module(model: nn.Module) -> nn.Module:
+    DDP_TYPES = (torch.nn.parallel.DataParallel, torch.nn.parallel.DistributedDataParallel)
+    return model.module if isinstance(model, DDP_TYPES) else model
+
 #=======================================================================#
-def num_parameters(model : nn.Module):
+def num_parameters(model : nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
-
-def mean_std(x: torch.tensor, channel_dim=-1):
-    dims = list(range(x.ndim))
-    del dims[channel_dim]
-    keepdim = (channel_dim != -1) and (channel_dim != x.ndim-1)
-
-    x_bar = x.mean(dims, keepdim=keepdim)
-    x_std = x.std( dims, keepdim=keepdim)
-
-    return x_bar, x_std
-
-def normalize(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
-    return (x - shift) / scale
-
-def unnormalize(x_norm: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
-    return x_norm * scale + shift
-
-#=======================================================================#
 
 def r2(y_pred, y_true):
     y_true = y_true.flatten()

@@ -7,12 +7,11 @@ from einops import repeat, rearrange
 from torch.nn import functional as F
 
 # supernode
-from torch_geometric.nn.pool import radius_graph
 # from torch_scatter import segment_csr
 
 # local
 from .perceiver import PerceiverDecoder
-from .transformer import SelfAttentionBlock
+from lra.models.backends import SelfAttentionBlock
 
 __all__ = [
     "UPT",
@@ -39,7 +38,9 @@ class SupernodeEncoder(nn.Module):
         self.enc_proj = nn.Linear(space_dim + fun_dim, channel_dim)
         
     def forward(self, pos: torch.Tensor, fun: torch.Tensor):
-        
+
+        from torch_geometric.nn.pool import radius_graph
+
         # for each batch
 
         supernode_idx = torch.randint(0, self.num_supernodes, (pos.shape[0],))

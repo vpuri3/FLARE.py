@@ -88,13 +88,10 @@ def make_statistics_plot(PROJDIR: str, filtered: bool = True):
     })
 
     fontsize = 24
-    fig, axs = plt.subplots(2, 3, figsize=(16, 12))
+    fig, axs = plt.subplots(1, 4, figsize=(16, 5))
 
-    labels = [r'\# Vertices', r'\# Edges', r'Avg. Aspect Ratio', r'Max. Aspect Ratio', r'Max $Z$ Height (mm)', r'Max $Z$ Displacement (mm)']
-    fields = ['num_vertices', 'num_edges', 'avg_aspect_ratio', 'max_aspect_ratio', 'max_z', 'max_disp']
-
-    axs[0, 0].set_ylabel(r'Density', fontsize=fontsize)
-    axs[1, 0].set_ylabel(r'Density', fontsize=fontsize)
+    labels = [r'\# Vertices', r'\# Edges', r'Max. Aspect Ratio', r'Max $Z$ Displacement (mm)']
+    fields = ['num_vertices', 'num_edges', 'max_aspect_ratio', 'max_disp']
 
     for (i, ax) in enumerate(axs.flatten()):
         ax.set_xlabel(labels[i], fontsize=fontsize)
@@ -104,9 +101,14 @@ def make_statistics_plot(PROJDIR: str, filtered: bool = True):
     for (i, ax) in enumerate(axs.flatten()):
         ax.set_xscale('linear')
         ax.grid(True, which="both", ls="-", alpha=0.5)
-        plt.subplot(2, 3, i+1)
+        plt.subplot(1, 4, i+1)
         sns.kdeplot(df[fields[i]], fill=True, warn_singular=False)
-        
+
+    axs[0].set_ylabel(r'Density', fontsize=fontsize)
+    axs[1].set_ylabel('')
+    axs[2].set_ylabel('')
+    axs[3].set_ylabel('')
+
     plt.tight_layout()
     plot_file = os.path.join(case_dir, 'dataset_statistics.pdf')
     plt.savefig(plot_file, dpi=300, bbox_inches='tight')

@@ -68,8 +68,8 @@ def collect_data(task: str):
                     'num_heads': config.get('num_heads'),
                     'num_latents': config.get('num_latents'),
                     'num_blocks': config.get('num_blocks'),
-                    'shared_latents': config.get('shared_latents'),
-                    'num_latent_blocks': config.get('num_latent_blocks'),
+                    'shared_att': config.get('shared_att'),
+                    'num_passes': config.get('num_passes'),
                 })
 
             # Load num_params
@@ -95,9 +95,9 @@ def collect_data(task: str):
 def plot_sl(df: pd.DataFrame):
 
     #---------------------------------------------------------#
-    df = df.groupby(['num_latents', 'num_blocks', 'shared_latents']).mean().reset_index()
+    df = df.groupby(['num_latents', 'num_blocks', 'shared_att']).mean().reset_index()
 
-    configs = df[['num_latents', 'shared_latents']].drop_duplicates()
+    configs = df[['num_latents', 'shared_att']].drop_duplicates()
     print(f"Found {len(configs)} unique configurations for num_blocks lineplot.")
 
     num_latents_list = configs['num_latents'].unique().tolist()
@@ -145,18 +145,18 @@ def plot_sl(df: pd.DataFrame):
     for i, num_latents in enumerate(num_latents_list):
         color = colors[i]
         
-        # Plot both shared_latents=False and shared_latents=True for this num_latents
-        for shared_latents in [False, True]:
-            df_ = df[(df['num_latents'] == num_latents) & (df['shared_latents'] == shared_latents)]
+        # Plot both shared_att=False and shared_att=True for this num_latents
+        for shared_att in [False, True]:
+            df_ = df[(df['num_latents'] == num_latents) & (df['shared_att'] == shared_att)]
             
             if len(df_) == 0:
                 continue
 
-            # Use solid line for shared_latents=False, dashed for shared_latents=True
-            linestyle = '-' if not shared_latents else '--'
+            # Use solid line for shared_att=False, dashed for shared_att=True
+            linestyle = '-' if not shared_att else '--'
             
             # Create label
-            sl_text = 'unshared' if not shared_latents else 'shared'
+            sl_text = 'unshared' if not shared_att else 'shared'
             label = r'M=%s (%s)' % (num_latents, sl_text)
 
             kwargs = {
@@ -182,8 +182,8 @@ def plot_sl(df: pd.DataFrame):
 #======================================================================#
 def plot_lb(df: pd.DataFrame):
     #---------------------------------------------------------#
-    # Group by num_blocks and num_latent_blocks, taking mean across other dimensions
-    df = df.groupby(['num_blocks', 'num_latent_blocks']).agg({
+    # Group by num_blocks and num_passes, taking mean across other dimensions
+    df = df.groupby(['num_blocks', 'num_passes']).agg({
         'test_rel_error': 'mean',
         'num_params': 'mean',
         'avg_time_per_epoch': 'mean'
@@ -191,25 +191,25 @@ def plot_lb(df: pd.DataFrame):
 
     # Define the axes values
     num_blocks_list = [1, 2, 4, 8]
-    num_latent_blocks_list = [0, 1, 2, 4, 8]
+    num_passes_list = [0, 1, 2, 4, 8]
 
     # Create pivot tables for the heatmap data
-    heatmap_data = pd.DataFrame(index=num_latent_blocks_list, columns=num_blocks_list)
-    params_data = pd.DataFrame(index=num_latent_blocks_list, columns=num_blocks_list)
-    time_data = pd.DataFrame(index=num_latent_blocks_list, columns=num_blocks_list)
+    heatmap_data = pd.DataFrame(index=num_passes_list, columns=num_blocks_list)
+    params_data = pd.DataFrame(index=num_passes_list, columns=num_blocks_list)
+    time_data = pd.DataFrame(index=num_passes_list, columns=num_blocks_list)
 
     # Fill the pivot tables
     for num_blocks in num_blocks_list:
-        for num_latent_blocks in num_latent_blocks_list:
-            row = df[(df['num_blocks'] == num_blocks) & (df['num_latent_blocks'] == num_latent_blocks)]
+        for num_passes in num_passes_list:
+            row = df[(df['num_blocks'] == num_blocks) & (df['num_passes'] == num_passes)]
             if len(row) > 0:
-                heatmap_data.loc[num_latent_blocks, num_blocks] = row['test_rel_error'].values[0]
-                params_data.loc[num_latent_blocks, num_blocks] = row['num_params'].values[0]
-                time_data.loc[num_latent_blocks, num_blocks] = row['avg_time_per_epoch'].values[0]
+                heatmap_data.loc[num_passes, num_blocks] = row['test_rel_error'].values[0]
+                params_data.loc[num_passes, num_blocks] = row['num_params'].values[0]
+                time_data.loc[num_passes, num_blocks] = row['avg_time_per_epoch'].values[0]
             else:
-                heatmap_data.loc[num_latent_blocks, num_blocks] = np.nan
-                params_data.loc[num_latent_blocks, num_blocks] = np.nan
-                time_data.loc[num_latent_blocks, num_blocks] = np.nan
+                heatmap_data.loc[num_passes, num_blocks] = np.nan
+                params_data.loc[num_passes, num_blocks] = np.nan
+                time_data.loc[num_passes, num_blocks] = np.nan
 
     # Convert to numpy arrays for plotting
     heatmap_array = heatmap_data.values.astype(float)
@@ -239,9 +239,9 @@ def plot_lb(df: pd.DataFrame):
 
     # Set ticks and labels
     ax.set_xticks(np.arange(len(num_blocks_list)))
-    ax.set_yticks(np.arange(len(num_latent_blocks_list)))
+    ax.set_yticks(np.arange(len(num_passes_list)))
     ax.set_xticklabels([str(b) for b in num_blocks_list], fontsize=fontsize)
-    ax.set_yticklabels([str(lb) for lb in num_latent_blocks_list], fontsize=fontsize)
+    ax.set_yticklabels([str(lb) for lb in num_passes_list], fontsize=fontsize)
 
     ax.set_xlabel(r'Number of blocks ($B$)', fontsize=fontsize)
     ax.set_ylabel(r'Number of latent blocks ($L_B$)', fontsize=fontsize)
@@ -251,7 +251,7 @@ def plot_lb(df: pd.DataFrame):
     vmax = np.nanmax(heatmap_array[~np.isnan(heatmap_array)])
 
     # Add annotations to each cell
-    for i in range(len(num_latent_blocks_list)):
+    for i in range(len(num_passes_list)):
         for j in range(len(num_blocks_list)):
             if not np.isnan(heatmap_array[i, j]):
                 # Format values
