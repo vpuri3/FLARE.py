@@ -28,7 +28,7 @@ def test_ablation_python_scripts_compile() -> None:
         ("ablate_num_blocks.py", []),
         ("ablate_num_heads.py", []),
         ("ablate_num_layers.py", []),
-        ("ablate_reviews.py", []),
+        ("ablate_sl_lb.py", []),
         ("time_memory_bwd.py", []),
     ],
 )
