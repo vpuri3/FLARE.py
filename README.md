@@ -1,4 +1,4 @@
-# FLARE.py: FLARE and Experimental Attention Models for PDEBench + LRA
+# FLARE.py: FLARE and Experimental Attention Models
 
 <p align="center">
 <a href="http://arxiv.org/abs/2508.12594" alt="arXiv">
