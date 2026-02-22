@@ -22,7 +22,56 @@ FLARE is a low-rank attention routing mechanism that keeps global communication 
 - **Broad experimental model zoo** for linear, low-rank, and higher-order attention ideas.
 - **Performance-oriented kernels**, including custom Triton implementations in `lra/models/triton/`.
 
-## Repository Scope
+FLARE exhibits excellent scaling and can tackle problems with millions of tokens on a single GPU.
+We present time and memory requirements of different attention schemes.
+On an input sequence of one million tokens, FLARE (red) is over $200\times$ faster than vanilla attention, while consuming marginally more memory.
+All models are implemented with flash attention (Dao et al., 2022), and the memory upper bound on a single H100 80GB GPU is depicted with a dashed line.
+Note that the curves for FLARE are somewhat overlapping.
+
+<p align="center">
+  <img src="figs/time_memory_bwd.png" alt="FLARE scaling" width="100%">
+</p>
+
+The implementation of FLARE is straightforward and employs highly optimized fused self-attention kernels.
+
+```python
+import torch.nn.functional as F
+def flare_multihead_mixer(q, k, v):
+    """
+    Arguments:
+    q: Query tensor [H, M, D]
+    k: Key tensor [B, H, N, D]
+    v: Value tensor [B, H, N, D]
+    Returns:
+    y: Output tensor [B, H, N, D]
+    """
+
+    z = F.scaled_dot_product_attention(q, k, v, scale=1.0)
+    y = F.scaled_dot_product_attention(k, q, z, scale=1.0)
+
+    return y
+```
+
+## Blog posts
+
+Detailed write-ups of FLARE and related attention mechanisms:
+
+- [Scaling attention to 1M tokens on a single GPU](https://vpuri3.github.io/blog/scaling-attention-to-1m-tokens-on-a-single-gpu/) — the FLARE gather–scatter mechanism, PDE benchmark results, and scaling analysis.
+- [From Encoder to Decoder: Extending FLARE to Memory-Efficient Causal Attention](https://vpuri3.github.io/blog/from-encoder-to-decoder-extending-flare-to-memory-efficient-causal-attention/) — causal FLARE for language modeling: recurrent decode, stable prefill, and training/inference tradeoffs.
+- [Higher-Order Attention in Linear Time](https://vpuri3.github.io/blog/adventures-in-high-order-attention/) — linear attention bottlenecks, multilinear memories, Strassen-style mixing, and triple/quad attention.
+- [Triple Attention in Triton](https://vpuri3.github.io/blog/triple-attention-in-triton-building-a-third-order-memory-in-linear-time/) — third-order memory in linear time, with a fused Triton kernel compared to the einsum reference.
+
+## Benchmark dataset of additive manufacturing (AM) simulations.
+
+We simulate the LPBF process on selected geometries from the Autodesk segementation dataset (Lambourne et al., 2021) to generate a benchmark dataset for AM calculations.
+Several geometries are presented in this gallery.
+The color indicates Z (vertical) displacement field.
+
+<p align="center">
+  <img src="figs/lpbf_gallery.jpg" alt="FLARE Architecture" width="100%">
+</p>
+
+## 🏗️ Codebase Architecture
 
 This codebase implements the FLARE architecture and is built upon the [`mlutils.py`](https://github.com/vpuri3/mlutils.py/tree/master) framework, which provides foundational ML training infrastructure with multi-GPU support, extendable trainer classes, and callback systems.
 
