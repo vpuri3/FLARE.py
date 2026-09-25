@@ -23,7 +23,11 @@ from typing import Literal
 
 import torch
 from torch import LongTensor, Tensor, nn
-from torch_geometric.utils import scatter
+
+try:
+    from torch_geometric.utils import scatter
+except ImportError:  # PyG is optional; only MultiscaleHopPE needs it.
+    scatter = None
 
 from pdebench.dataset.sample import FeatureRequest
 
@@ -238,6 +242,8 @@ class MultiscaleHopPE(GraphPE):
     """Pool learned relative geometry over exact multi-scale hop neighborhoods."""
 
     def __init__(self, config: MultiscaleHopPEConfig, *, pos_dim: int = 3) -> None:
+        if scatter is None:
+            raise ImportError("MultiscaleHopPE requires torch_geometric (scripts/install.sh, PyG stack).")
         super().__init__()
         self.config = config
         self.pos_dim = int(pos_dim)
