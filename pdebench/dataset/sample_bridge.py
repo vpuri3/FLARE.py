@@ -14,12 +14,14 @@ and anything ``attach_sample_feats`` adds) round-trip through ``Sample.extras``.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
-from torch_geometric.data import Data
 
 from pdebench.dataset.sample import Sample, SampleKind
+
+if TYPE_CHECKING:
+    from torch_geometric.data import Data
 
 _PYG_EXTRA_KEYS = (
     "input_scalars",
@@ -67,6 +69,8 @@ def pyg_data_to_sample(data: Data, *, kind: SampleKind = SampleKind.STATIC) -> S
 
 
 def sample_to_pyg_data(sample: Sample) -> Data:
+    from torch_geometric.data import Data
+
     kwargs: dict[str, Any] = {
         "pos": sample.pos,
         "y": sample.y,

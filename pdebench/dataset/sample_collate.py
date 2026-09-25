@@ -22,17 +22,20 @@ the equality goldens vs. ``ginot_collate_fn`` on legacy dicts).
 
 from __future__ import annotations
 
-from typing import Any
-
-from torch_geometric.data import Batch, Data
+from typing import TYPE_CHECKING, Any
 
 from pdebench.dataset.ginot.collate import ginot_collate_fn
 from pdebench.dataset.sample import Sample
 from pdebench.dataset.sample_bridge import sample_to_ginot_dict, sample_to_pyg_data
 
+if TYPE_CHECKING:
+    from torch_geometric.data import Batch, Data
+
 
 def collate_samples_plaid_static(samples: list[Sample]) -> Batch:
     """Convert each ``Sample`` to PyG ``Data`` then batch with ``Batch.from_data_list``."""
+    from torch_geometric.data import Batch
+
     if not samples:
         raise ValueError("collate_samples_plaid_static received an empty batch.")
     data_list = [sample_to_pyg_data(sample) for sample in samples]
@@ -41,6 +44,8 @@ def collate_samples_plaid_static(samples: list[Sample]) -> Batch:
 
 def collate_plaid_static(batch: list[Sample] | list[Data]) -> Batch:
     """Dispatch to the ``Sample`` or legacy ``Data`` collate path based on item type."""
+    from torch_geometric.data import Batch, Data
+
     if not batch:
         raise ValueError("collate_plaid_static received an empty batch.")
     first = batch[0]

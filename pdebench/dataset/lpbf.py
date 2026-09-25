@@ -7,9 +7,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch_geometric as pyg
 
 import pdebench
+
+try:
+    import torch_geometric as pyg
+except ImportError:  # PyG is optional; only LPBFDataset needs it.
+    pyg = None
 
 LPBF_DATASETS = frozenset({"lpbf"})
 LPBF_DIRNAME = "lpbf"
@@ -305,10 +309,12 @@ def lpbf_flare_batch_loss(
 
 # ======================================================================#
 # Module-level so DataLoader workers can pickle the dataset (num_workers > 0).
-class LPBFDataset(pyg.data.Dataset):
+class LPBFDataset(pyg.data.Dataset if pyg is not None else object):
     """FLARE HF LPBF graphs (``vedantpuri/LPBF_FLARE``). Built via ``create_lpbf_dataset``."""
 
     def __init__(self, split="train", transform=None):
+        if pyg is None:
+            raise ImportError("The LPBF dataset requires torch_geometric (scripts/install.sh, PyG stack).")
         import datasets
 
         assert split in ["train", "test"], f"Invalid split: {split}. Must be one of: 'train', 'test'."
