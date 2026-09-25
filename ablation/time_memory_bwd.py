@@ -212,7 +212,8 @@ class FLARE(nn.Module):
         num_heads: int = 8,
         num_latents: int = 32,
         act: str = None,
-        num_layers_kv_proj: int = 3,
+        num_layers_qk_proj: int = 3,
+        qk_norm: bool = False,
     ):
         super().__init__()
 
@@ -220,6 +221,7 @@ class FLARE(nn.Module):
         self.num_latents = num_latents
         self.num_heads = num_heads
         self.head_dim = self.channel_dim // self.num_heads
+        self.qk_norm = qk_norm
 
         assert self.channel_dim % self.num_heads == 0, f"channel_dim must be divisible by num_heads. Got {self.channel_dim} and {self.num_heads}."
 
@@ -228,8 +230,11 @@ class FLARE(nn.Module):
 
         self.k_proj, self.v_proj = [ResidualMLP(
             in_dim=self.channel_dim, hidden_dim=self.channel_dim, out_dim=self.channel_dim,
-            num_layers=num_layers_kv_proj, act=act, input_residual=True, output_residual=True,
+            num_layers=num_layers_qk_proj, act=act, input_residual=True, output_residual=True,
         ) for _ in range(2)]
+
+        self.q_norm = nn.RMSNorm(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = nn.RMSNorm(self.head_dim) if qk_norm else nn.Identity()
 
         self.out_proj = nn.Linear(self.channel_dim, self.channel_dim)
 
@@ -238,6 +243,9 @@ class FLARE(nn.Module):
         q = self.latent_q.view(self.num_heads, self.num_latents, self.head_dim) # [H M D]
         k = rearrange(self.k_proj(x), 'b n (h d) -> b h n d', h=self.num_heads) # [B H N D]
         v = rearrange(self.v_proj(x), 'b n (h d) -> b h n d', h=self.num_heads)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         #--------------------------------------------#
         q = q.unsqueeze(0).expand(x.size(0), -1, -1, -1) # required for fused attention
@@ -510,8 +518,6 @@ def run_analysis(fp16=True):
 
     assert channel_dim % num_heads == 0, f"channel_dim must be divisible by num_heads. Got {channel_dim} and {num_heads}."
 
-    num_layers_kv_proj = 3
-
     models = []
     model_names = []
 
@@ -528,8 +534,27 @@ def run_analysis(fp16=True):
     # model_names = model_names + [MSHA_unfused_name]
 
     # FLARE
-    FLARE_names = [f'FLARE (M={NUM_LATENTS[i]})' for i in range(len(NUM_LATENTS))]
-    FLAREs = [FLARE(channel_dim=channel_dim, num_heads=num_heads, num_latents=NUM_LATENTS[i], num_layers_kv_proj=num_layers_kv_proj) for i in range(len(NUM_LATENTS))]
+    flare_variants = [
+        ("qk_layers=3", dict(num_layers_qk_proj=3, qk_norm=False)),
+        ("qk_proj=linear, qk_norm", dict(num_layers_qk_proj=-1, qk_norm=True)),
+    ]
+    FLARE_specs = [
+        (
+            f"FLARE (M={num_latents}, {variant_name})",
+            dict(num_latents=num_latents, **kwargs),
+        )
+        for num_latents in NUM_LATENTS
+        for variant_name, kwargs in flare_variants
+    ]
+    FLAREs = [
+        FLARE(
+            channel_dim=channel_dim,
+            num_heads=num_heads,
+            **kwargs,
+        )
+        for _, kwargs in FLARE_specs
+    ]
+    FLARE_names = [name for name, _ in FLARE_specs]
     models = models + FLAREs
     model_names = model_names + FLARE_names
 
@@ -696,13 +721,6 @@ def plot_analysis(fp16=True):
         f"{NUM_LATENTS[2]}": 'D',
     }
 
-    # Define markers for different num_states (Multilinear)
-    states_map = {
-        '1': 'o',
-        '2': 'v',
-        '4': 'D',
-    }
-
     # Set custom x-ticks for sequence lengths
     x_ticks = [1000, 100000, 200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000]
     x_tick_labels = ['1k', '', '200k', '', '400k', '', '600k', '', '800k', '', '1m']
@@ -714,99 +732,77 @@ def plot_analysis(fp16=True):
     # Add horizontal dashed line at Memory = 80 GB
     ax2.axhline(y=80, color='black', linestyle='--', linewidth=3.0)
 
-    for model_name in df['model_name'].unique():
+    plot_specs = [
+        ('Softmax Attn', 'Softmax Attn', 'black', 'o', '-'),
+        ('Phys Attn (M=128)', r'Phys Attn ($M=128$)', 'blue', 'o', '--'),
+        ('Phys Attn (M=512)', r'Phys Attn ($M=512$)', 'blue', 'v', '--'),
+        ('Phys Attn (M=2048)', r'Phys Attn ($M=2048$)', 'blue', 'D', '--'),
+    ]
+
+    for num_latents, marker in zip(NUM_LATENTS, ['s', 'v', 'D']):
+        plot_specs.append((
+            f'FLARE (M={num_latents}, qk_layers=3)',
+            rf'FLARE ($M={num_latents}$, qk_layers=3)',
+            'red',
+            marker,
+            '-',
+        ))
+        plot_specs.append((
+            f'FLARE (M={num_latents}, qk_proj=linear, qk_norm)',
+            rf'FLARE ($M={num_latents}$, qk_proj=linear, qk-norm)',
+            'magenta',
+            marker,
+            '--',
+        ))
+
+    for model_name, label, color, marker, linestyle in plot_specs:
         model_data = df[df['model_name'] == model_name]
+        if model_data.empty:
+            raise ValueError(f"Missing expected model series: {model_name}")
         model_data = model_data.sort_values(by='N')
 
-        if 'Softmax' in model_name:
-            marker = 'o'
-            color = 'black'
-            linestyle = '-'
-            label = r'Softmax Attention'
-        elif 'Phys' in model_name:
-            slice_num = model_name.split('=')[1].strip(')')
-            marker = latent_map[slice_num]
-            linestyle = '--'
-            color = 'blue'
-            label = r'PhysAttention ($%s$ slices)' % slice_num
-        elif 'FLARE' in model_name:
-            latent_size = model_name.split('=')[1].strip(')')
-            marker = latent_map[latent_size]
-            linestyle = '--'
-            color = 'red'
-            label = r'FLARE ($%s$ latents) (ours)' % latent_size
-        # elif 'Triple' in model_name:
-        #     marker = '^'
-        #     color = 'green'
-        #     linestyle = '-.'
-        #     label = r'Triple Attention'
-        # elif 'Multilinear' in model_name:
-        #     num_states = model_name.split('=')[1].strip(')')
-        #     marker = states_map[num_states]
-        #     linestyle = ':'
-        #     color = 'blue'
-        #     label = r'Multilinear ($L=%s$)' % num_states
+        ax1.plot(
+            model_data['N'],
+            model_data['time'] / 1e3,
+            label=label,
+            marker=marker,
+            linestyle=linestyle,
+            linewidth=2.5,
+            color=color,
+            markersize=8,
+        )
+        ax2.plot(
+            model_data['N'],
+            model_data['memory'],
+            label=label,
+            marker=marker,
+            linestyle=linestyle,
+            linewidth=2.5,
+            color=color,
+            markersize=8,
+        )
 
-        marker_size = 8
-
-        ax1.plot(model_data['N'], model_data['time'] / 1e3, label=label, marker=marker, 
-            linestyle=linestyle, linewidth=2.5, color=color, markersize=marker_size)
-        ax2.plot(model_data['N'], model_data['memory'], label=label, marker=marker, 
-            linestyle=linestyle, linewidth=2.5, color=color, markersize=marker_size)
-
-    # Add legend to bottom of the figure with 4 columns, 2 rows
+    # Add legend to bottom of the figure with two rows.
     handles, labels = ax1.get_legend_handles_labels()
+    ordered_handles = handles
+    ordered_labels = labels
 
-    # Organize legend: FLARE variants in row 1 cols 1-3, Softmax in row 1 col 4, PhysAttention variants in row 2 cols 1-3
-    flare_items = [(h, l) for h, l in zip(handles, labels) if 'FLARE' in l]
-    physics_items = [(h, l) for h, l in zip(handles, labels) if 'PhysAttention' in l]
-    softmax_items = [(h, l) for h, l in zip(handles, labels) if 'Softmax' in l]
-    
-    # Sort FLARE items by number of latents (128, 512, 2048)
-    def extract_num(s):
-        import re
-        match = re.search(r'\((\d+)\)', s)
-        return int(match.group(1)) if match else 0
-    flare_items.sort(key=lambda x: extract_num(x[1]))
-    physics_items.sort(key=lambda x: extract_num(x[1]))
-    
-    # Create ordered lists for multi-row layout: 2 rows, 4 columns
-    # With ncol=4, matplotlib fills row by row:
-    # Position 0: Row 1, Col 1
-    # Position 1: Row 1, Col 2
-    # Position 2: Row 1, Col 3
-    # Position 3: Row 1, Col 4
-    # Position 4: Row 2, Col 1
-    # Position 5: Row 2, Col 2
-    # Position 6: Row 2, Col 3
-    # Position 7: Row 2, Col 4
-    ordered_handles = []
-    ordered_labels = []
-
-    # Order: [*FLARE[1:3], *PhysAttn[1:3], SoftmaxAttn] in row-first layout
-    # Row 1: FLARE variants (positions 0, 1, 2) + PhysAttention (128) (position 3)
-    # Row 2: PhysAttention (512, 2048) (positions 4, 5) + Softmax (position 6)
-    
-    # All FLARE variants first
-    for i in range(len(flare_items)):
-        ordered_handles.append(flare_items[i][0])
-        ordered_labels.append(flare_items[i][1])
-    
-    # All PhysAttention variants next
-    for i in range(len(physics_items)):
-        ordered_handles.append(physics_items[i][0])
-        ordered_labels.append(physics_items[i][1])
-
-    # Softmax last
-    if len(softmax_items) > 0:
-        ordered_handles.append(softmax_items[0][0])
-        ordered_labels.append(softmax_items[0][1])
-
-    # Place legend below the subplots with 4 columns
-    legend = fig.legend(ordered_handles, ordered_labels, loc='lower center', ncol=4, 
-              frameon=True, fancybox=False, shadow=False, fontsize=fontsize, 
-              bbox_to_anchor=(0.5, 0.00), columnspacing=0.5, handletextpad=0.2,
-              bbox_transform=fig.transFigure, handlelength=1.5, markerscale=1.5)
+    legend = fig.legend(
+        ordered_handles,
+        ordered_labels,
+        loc='lower center',
+        ncol=5,
+        frameon=True,
+        fancybox=False,
+        shadow=False,
+        fontsize=fontsize,
+        bbox_to_anchor=(0.5, 0.00),
+        columnspacing=0.8,
+        handletextpad=0.3,
+        bbox_transform=fig.transFigure,
+        handlelength=1.5,
+        markerscale=1.5,
+    )
 
     # Add title with larger font
     ax1.set_title(r'Execution Time (Forward + Backward)', fontsize=fontsize)
@@ -895,7 +891,6 @@ if __name__ == '__main__':
     parser.add_argument('--plot', type=str_to_bool, default=False, help='Plot forward+backward timing results')
     parser.add_argument('--clean', type=str_to_bool, default=False, help='Clean forward+backward timing results')
     parser.add_argument('--fp16', type=str_to_bool, default=True, help='Use FP16 precision (default: True)')
-
     args = parser.parse_args()
 
     if args.clean:

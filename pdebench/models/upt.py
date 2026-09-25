@@ -6,6 +6,9 @@ import torch.nn as nn
 from einops import repeat, rearrange
 from torch.nn import functional as F
 
+from dataclasses import dataclass
+from typing import Optional
+
 # supernode
 # from torch_scatter import segment_csr
 
@@ -16,6 +19,11 @@ from lra.models.backends import SelfAttentionBlock
 __all__ = [
     "UPT",
 ]
+
+@dataclass
+class UPTConfig:
+    model: str = "upt"
+
 
 #======================================================================#
 # Universal Physics Transformer (UPT)

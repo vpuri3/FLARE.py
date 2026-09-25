@@ -2,7 +2,6 @@
 #============================#
 # Setup
 #============================#
-source ~/.bash_profile
 cd /project/community/$(whoami)/FLARE-dev.py
 source .venv/bin/activate
 

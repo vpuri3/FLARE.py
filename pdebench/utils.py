@@ -6,10 +6,15 @@ import torch.nn.functional as F
 
 __all__ = [
     'make_optimizer_adamw',
+    'make_optimizer_plain_adamw',
     'make_optimizer_lion',
     'make_optimizer_muon',
+    'NavierStokesModelAdapter',
+    'PlasticityModelAdapter',
     #
     'darcy_deriv_loss',
+    'rollout_navier_stokes',
+    'rollout_plasticity',
     #
     'RelL1Loss',
     'RelL2Loss',
@@ -33,10 +38,6 @@ NO_DECAY_TYPES = (
     nn.InstanceNorm3d,
 )
 
-LATENT_TYPES = (
-    nn.Parameter,
-)
-
 def _collect_param_ids_by_module_types(model, types):
     ids = set()
     for module in model.modules():
@@ -46,83 +47,166 @@ def _collect_param_ids_by_module_types(model, types):
     return ids
 
 #======================================================================#
-def split_params_adamw(model, no_decay_types=NO_DECAY_TYPES, latent_types=LATENT_TYPES):
+def is_glt_c_stream_param(name: str) -> bool:
+    """True for dual-stream GLT c_proj / blocks_c weights (not biases/norms)."""
+    parts = name.split(".")
+    return "c_proj" in parts or "blocks_c" in parts
+
+
+def _is_no_decay_param(name: str, param: torch.nn.Parameter, no_decay_param_ids: set[int]) -> bool:
+    return (
+        (no_decay_param_ids is not None and id(param) in no_decay_param_ids)
+        or name.endswith("bias")
+        or "LayerNorm" in name
+        or "layernorm" in name
+        or "RMSNorm" in name
+        or "rmsnorm" in name
+        or "embed" in name.lower()
+        or "cls_token" in name
+    )
+
+
+def _is_latent_param(name: str) -> bool:
+    """True for zero-decay FLARE/GLT specials (latent queries, gate logits).
+
+    Examples: ``latent_q``, ``latent_q_routing``, ``latent_q_fixed``, ``gate_logit``.
+    """
+    return "latent" in name or "gate_logit" in name
+
+
+def split_params_adamw(
+    model,
+    no_decay_types=NO_DECAY_TYPES,
+    *,
+    c_stream_weight_decay: float | None = None,
+):
     decay_params = []
+    c_stream_decay_params = []
     no_decay_params = []
     latent_params = []
 
-    latent_param_ids = _collect_param_ids_by_module_types(model, latent_types)
     no_decay_param_ids = _collect_param_ids_by_module_types(model, no_decay_types)
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue  # skip frozen weights
-        if (
-            (no_decay_param_ids is not None and id(param) in no_decay_param_ids) or 
-            name.endswith("bias") or 
-            "LayerNorm" in name or "layernorm" in name or 
-            "RMSNorm" in name or "rmsnorm" in name or
-            "embed" in name.lower() or
-            "cls_token" in name
-        ):
+        if _is_no_decay_param(name, param, no_decay_param_ids):
             no_decay_params.append(param)
-        elif (
-            "latent" in name and
-            (latent_param_ids is not None and id(param) in latent_param_ids)
-        ):
+        elif _is_latent_param(name):
             latent_params.append(param)
+        elif c_stream_weight_decay is not None and is_glt_c_stream_param(name):
+            c_stream_decay_params.append(param)
         else:
             decay_params.append(param)
 
-    return decay_params, no_decay_params, latent_params
+    if c_stream_weight_decay is None:
+        return decay_params, no_decay_params, latent_params
+    return decay_params, c_stream_decay_params, no_decay_params, latent_params
 
 #======================================================================#
-def make_optimizer_adamw(model, lr, weight_decay=0.0, beta1=0.9, beta2=0.999, eps=1e-8):
-    decay_params, no_decay_params, latent_params = split_params_adamw(model, NO_DECAY_TYPES, LATENT_TYPES)
-
+def _broadcast_hparams(lr, weight_decay, beta1, beta2, eps, num_groups: int):
     if isinstance(lr, float) or isinstance(lr, int):
-        lr = [lr] * 3
+        lr = [lr] * num_groups
     if isinstance(weight_decay, float) or isinstance(weight_decay, int):
-        weight_decay = [weight_decay, 0.0, 0.0]
+        weight_decay = [weight_decay] * num_groups
     if isinstance(beta1, float) or isinstance(beta1, int):
-        beta1 = [beta1] * 3
+        beta1 = [beta1] * num_groups
     if isinstance(beta2, float) or isinstance(beta2, int):
-        beta2 = [beta2] * 3
+        beta2 = [beta2] * num_groups
     if isinstance(eps, float) or isinstance(eps, int):
-        eps = [eps] * 3
+        eps = [eps] * num_groups
+    return lr, weight_decay, beta1, beta2, eps
 
-    assert len(lr) == 3, f"lr must be a list of 3 elements, got {lr} with {len(lr)} elements"
-    assert len(weight_decay) == 3, f"weight_decay must be a list of 3 elements, got {weight_decay} with {len(weight_decay)} elements"
-    assert len(beta1) == 3, f"beta1 must be a list of 3 elements, got {beta1} with {len(beta1)} elements"
-    assert len(beta2) == 3, f"beta2 must be a list of 3 elements, got {beta2} with {len(beta2)} elements"
-    assert len(eps) == 3, f"eps must be a list of 3 elements, got {eps} with {len(eps)} elements"
 
-    decay_param_group = {
-        'params': decay_params,
-        'weight_decay': weight_decay[0],
-        'lr': lr[0],
-        'betas': (beta1[0], beta2[0]),
-        'eps': eps[0]
-    }
-    no_decay_param_group = {
-        'params': no_decay_params,
-        'weight_decay': weight_decay[1],
-        'lr': lr[1],
-        'betas': (beta1[1], beta2[1]),
-        'eps': eps[1]
-    }
-    latent_param_group = {
-        'params': latent_params,
-        'weight_decay': weight_decay[2],
-        'lr': lr[2],
-        'betas': (beta1[2], beta2[2]),
-        'eps': eps[2]
-    }
+def make_optimizer_adamw(
+    model,
+    lr,
+    weight_decay=0.0,
+    beta1=0.9,
+    beta2=0.999,
+    eps=1e-8,
+    *,
+    c_stream_weight_decay: float | None = None,
+):
+    if c_stream_weight_decay is None:
+        decay_params, no_decay_params, latent_params = split_params_adamw(model, NO_DECAY_TYPES)
+        num_groups = 3
+        if isinstance(weight_decay, float) or isinstance(weight_decay, int):
+            weight_decay = [float(weight_decay), 0.0, 0.0]
+        lr, weight_decay, beta1, beta2, eps = _broadcast_hparams(lr, weight_decay, beta1, beta2, eps, num_groups)
+        param_groups = [
+            {
+                "params": decay_params,
+                "weight_decay": weight_decay[0],
+                "lr": lr[0],
+                "betas": (beta1[0], beta2[0]),
+                "eps": eps[0],
+            },
+            {
+                "params": no_decay_params,
+                "weight_decay": weight_decay[1],
+                "lr": lr[1],
+                "betas": (beta1[1], beta2[1]),
+                "eps": eps[1],
+            },
+            {
+                "params": latent_params,
+                "weight_decay": weight_decay[2],
+                "lr": lr[2],
+                "betas": (beta1[2], beta2[2]),
+                "eps": eps[2],
+            },
+        ]
+        return torch.optim.AdamW(param_groups)
 
-    param_groups = [decay_param_group, no_decay_param_group, latent_param_group]
-    optimizer = torch.optim.AdamW(param_groups)
+    decay_params, c_stream_decay_params, no_decay_params, latent_params = split_params_adamw(
+        model,
+        NO_DECAY_TYPES,
+        c_stream_weight_decay=float(c_stream_weight_decay),
+    )
+    num_groups = 4
+    lr, _, beta1, beta2, eps = _broadcast_hparams(lr, weight_decay, beta1, beta2, eps, num_groups)
+    weight_decay_groups = [float(weight_decay), float(c_stream_weight_decay), 0.0, 0.0]
+    param_groups = [
+        {
+            "params": decay_params,
+            "weight_decay": weight_decay_groups[0],
+            "lr": lr[0],
+            "betas": (beta1[0], beta2[0]),
+            "eps": eps[0],
+        },
+        {
+            "params": c_stream_decay_params,
+            "weight_decay": weight_decay_groups[1],
+            "lr": lr[1],
+            "betas": (beta1[1], beta2[1]),
+            "eps": eps[1],
+        },
+        {
+            "params": no_decay_params,
+            "weight_decay": weight_decay_groups[2],
+            "lr": lr[2],
+            "betas": (beta1[2], beta2[2]),
+            "eps": eps[2],
+        },
+        {
+            "params": latent_params,
+            "weight_decay": weight_decay_groups[3],
+            "lr": lr[3],
+            "betas": (beta1[3], beta2[3]),
+            "eps": eps[3],
+        },
+    ]
+    return torch.optim.AdamW(param_groups)
 
-    return optimizer
+def make_optimizer_plain_adamw(model, lr, weight_decay=0.0, beta1=0.9, beta2=0.999, eps=1e-8):
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=weight_decay,
+        betas=(beta1, beta2),
+        eps=eps,
+    )
 
 def make_optimizer_lion(model, lr, weight_decay=0.0, beta1=0.9, beta2=0.999, eps=1e-8):
     decay_params, no_decay_params, latent_params = split_params_adamw(model, NO_DECAY_TYPES)
@@ -274,6 +358,102 @@ def make_optimizer_muon(model, lr, weight_decay=0.0, betas=None, eps=None, **kwa
         optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
 
     return optimizer
+
+
+class NavierStokesModelAdapter(nn.Module):
+    def __init__(self, model: nn.Module, model_type: str):
+        super().__init__()
+        self.model = model
+        self.model_type = model_type
+
+    def set_context_parallel(self, cp_state, cp_debug_gather_outputs: bool = False):
+        if not hasattr(self.model, "set_context_parallel"):
+            raise AttributeError(f"{self.model.__class__.__name__} does not support context parallel.")
+        self.model.set_context_parallel(cp_state, cp_debug_gather_outputs=cp_debug_gather_outputs)
+
+    def forward(self, pos: torch.Tensor, history: torch.Tensor):
+        if self.model_type in {'transolver', 'lamo', 'gnot', 'mambano', 'lno'}:
+            return self.model(pos, history)
+        x = torch.cat((pos, history), dim=-1)
+        return self.model(x)
+
+
+class PlasticityModelAdapter(nn.Module):
+    def __init__(self, model: nn.Module, model_type: str):
+        super().__init__()
+        self.model = model
+        self.model_type = model_type
+
+    def set_context_parallel(self, cp_state, cp_debug_gather_outputs: bool = False):
+        if not hasattr(self.model, "set_context_parallel"):
+            raise AttributeError(f"{self.model.__class__.__name__} does not support context parallel.")
+        self.model.set_context_parallel(cp_state, cp_debug_gather_outputs=cp_debug_gather_outputs)
+
+    def forward(self, pos: torch.Tensor, features: torch.Tensor, time_input: torch.Tensor):
+        time_feature = time_input[:, None, :].expand(-1, pos.shape[1], -1)
+
+        if self.model_type in {'transolver', 'lamo', 'gnot'}:
+            return self.model(pos, features, time_input)
+        if self.model_type == 'mambano':
+            return self.model(pos, torch.cat((features, time_feature), dim=-1))
+        if self.model_type == 'lno':
+            trunk = torch.cat((pos, time_feature), dim=-1)
+            return self.model(trunk, features)
+
+        x = torch.cat((pos, features, time_feature), dim=-1)
+        return self.model(x)
+
+
+def rollout_navier_stokes(model, pos, history, target, lossfun, teacher_forcing: bool):
+    """Run a fixed-horizon Navier-Stokes rollout.
+
+    The upstream Transolver benchmark trains with teacher forcing over the
+    10-step prediction horizon and evaluates autoregressively. This helper
+    mirrors that behavior while keeping the input contract explicit:
+    `pos` carries spatial coordinates, `history` is the rolling 10-step input
+    window, and `target` is the 10-step future trajectory.
+    """
+
+    preds = []
+    step_loss = 0.0
+    state = history
+
+    for t in range(target.shape[-1]):
+        y = target[..., t:t + 1]
+        pred = model(pos, state)
+        preds.append(pred)
+        step_loss = step_loss + lossfun(pred, y)
+
+        next_state = y if teacher_forcing else pred
+        state = torch.cat((state[..., 1:], next_state), dim=-1)
+
+    pred_full = torch.cat(preds, dim=-1)
+    full_loss = lossfun(pred_full, target)
+
+    return pred_full, step_loss, full_loss
+
+
+def rollout_plasticity(model, pos, time_grid, features, target, lossfun):
+    preds = []
+    step_loss = torch.zeros((), device=target.device, dtype=target.dtype)
+
+    for step in range(target.shape[-1]):
+        time_input = time_grid[:, step:step + 1]
+        frame_target = target[..., step]
+        frame_pred = model(pos, features, time_input)
+        preds.append(frame_pred.unsqueeze(-1))
+        step_loss = step_loss + lossfun(
+            frame_pred.reshape(frame_pred.shape[0], -1),
+            frame_target.reshape(frame_target.shape[0], -1),
+        )
+
+    pred_full = torch.cat(preds, dim=-1)
+    full_loss = lossfun(
+        pred_full.reshape(pred_full.shape[0], -1),
+        target.reshape(target.shape[0], -1),
+    )
+
+    return pred_full, step_loss, full_loss
 
 #======================================================================#
 from torch.optim.optimizer import Optimizer

@@ -11,17 +11,36 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 import mlutils
+from mlutils.metrics import format_scalar, normalize_metric
 
 __all__ = [
     'Callback',
 ]
+
+
+def _mean_or_null(values):
+    if len(values) == 0:
+        return None
+    return torch.mean(torch.tensor(values)).item()
+
+
+def _max_or_null(values, *, default=None):
+    if len(values) == 0:
+        return default
+    return max(values)
+
 
 #======================================================================#
 class Callback:
     def __init__(self, case_dir: str, save_every=None):
         self.case_dir = case_dir
         self.save_every = save_every
+        # NOTE: `self.final` is consumed by downstream callback subclasses
+        # (e.g. `am/callbacks.py`, `pdebench/callbacks_timeseries.py`).
+        # In this base class it is only set in `__call__` to indicate the
+        # final/evaluate callback mode for the current invocation.
         self.final = False
+        self._model_summary_saved = False
 
     def get_ckpt_dir(self, trainer: mlutils.Trainer):
         if self.final:
@@ -50,10 +69,38 @@ class Callback:
 
         return
 
+    def save_model_summary(self, trainer: mlutils.Trainer, final: bool=False):
+        """
+        Save model architecture (including block structure) and parameter counts
+        to a single text file in the experiment directory at run start.
+        """
+        if trainer.GLOBAL_RANK != 0:
+            return
+
+        summary_dir = os.path.join(self.case_dir, 'eval') if final else self.case_dir
+        os.makedirs(summary_dir, exist_ok=True)
+
+        num_params = sum(p.numel() for p in trainer.model.parameters())
+        num_trainable_params = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
+        num_non_trainable_params = num_params - num_trainable_params
+
+        with open(os.path.join(summary_dir, 'model_blocks.txt'), 'w') as f:
+            f.write(str(trainer.model))
+            f.write("\n\n")
+            f.write(f"model_class: {trainer.model.__class__.__name__}\n")
+            f.write(f"num_params: {num_params}\n")
+            f.write(f"num_trainable_params: {num_trainable_params}\n")
+            f.write(f"num_non_trainable_params: {num_non_trainable_params}\n")
+
     @torch.no_grad()
     def __call__(self, trainer: mlutils.Trainer, final: bool=False):
+        if not self._model_summary_saved:
+            self.save_model_summary(trainer, final=final)
+            self._model_summary_saved = True
 
         #------------------------#
+        # `self.final` is invocation-scoped state used by downstream callback
+        # subclasses to switch behavior for final/evaluate mode.
         self.final = final
         if not self.final:
             if self.save_every is None:
@@ -88,31 +135,58 @@ class Callback:
 
         # ensure statistics are computed
         # if all stat_lists are empty, compute statistics
-        if all([len(l) == 0 for l in stat_lists.values()]):
+        startup_stats = (
+            trainer.epoch == 0
+            and trainer.step == 0
+            and not getattr(trainer, "fullbatch_stats_on_start", False)
+        )
+        if all(len(values) == 0 for values in stat_lists.values()) and not startup_stats:
             trainer.statistics()
 
         # save consolidated statistics
-        stat_vals = {k: (v[-1] if len(v) > 0 else None) for k, v in stat_lists.items()}
+        stat_vals = {
+            k: normalize_metric(v[-1] if len(v) > 0 else None)
+            for k, v in stat_lists.items()
+        }
         if trainer.GLOBAL_RANK == 0:
             with open(os.path.join(ckpt_dir, 'stats.json'), 'w') as f:
                 json.dump(stat_vals, f, indent=4)
 
         # save model_stats.json
+        recent = 50
         model_stats = dict(
             num_params=sum(p.numel() for p in trainer.model.parameters()),
-            avg_time_per_step=torch.mean(torch.tensor(trainer.time_per_step)).item(),
-            avg_time_dataload_per_step=torch.mean(torch.tensor(trainer.time_dataload_per_step)).item(),
-            avg_time_model_eval_per_step=torch.mean(torch.tensor(trainer.time_model_eval_per_step)).item(),
-            avg_time_per_epoch=torch.mean(torch.tensor(trainer.time_per_epoch)).item(),
-            avg_memory_utilization=torch.mean(torch.tensor(trainer.memory_utilization)).item(),
-            avg_train_stats_time=torch.mean(torch.tensor(trainer.train_stats_time)).item(),
-            avg_test_stats_time=torch.mean(torch.tensor(trainer.test_stats_time)).item(),
+            avg_time_per_step=_mean_or_null(trainer.time_per_step),
+            avg_time_dataload_per_step=_mean_or_null(trainer.time_dataload_per_step),
+            avg_time_model_eval_per_step=_mean_or_null(trainer.time_model_eval_per_step),
+            recent_time_window=recent,
+            recent_time_per_step=_mean_or_null(trainer.time_per_step[-recent:]),
+            recent_time_dataload_per_step=_mean_or_null(trainer.time_dataload_per_step[-recent:]),
+            recent_time_model_eval_per_step=_mean_or_null(trainer.time_model_eval_per_step[-recent:]),
+            avg_time_per_epoch=_mean_or_null(trainer.time_per_epoch),
+            avg_memory_utilization=_mean_or_null(trainer.memory_utilization),
+            avg_memory_allocated=_mean_or_null(getattr(trainer, 'memory_allocated', [])),
+            avg_memory_reserved=_mean_or_null(getattr(trainer, 'memory_reserved', [])),
+            avg_max_memory_allocated=_mean_or_null(getattr(trainer, 'max_memory_allocated', trainer.memory_utilization)),
+            avg_max_memory_reserved=_mean_or_null(getattr(trainer, 'max_memory_reserved', [])),
+            peak_memory_allocated=_max_or_null(getattr(trainer, 'max_memory_allocated', trainer.memory_utilization)),
+            peak_memory_reserved=_max_or_null(getattr(trainer, 'max_memory_reserved', [])),
+            avg_train_stats_time=_mean_or_null(trainer.train_stats_time),
+            avg_test_stats_time=_mean_or_null(trainer.test_stats_time),
         )
 
         if trainer.GLOBAL_RANK == 0:
             print()
-            print(f"Time per step: {model_stats['avg_time_per_step']:.4e}s\tTime per epoch: {model_stats['avg_time_per_epoch']:.4e}s\tMemory utilization: {model_stats['avg_memory_utilization']:.4e}GB")
-            print(f"Time per step (data fetching): {model_stats['avg_time_dataload_per_step']:.4e}s\tTime per step (model eval): {model_stats['avg_time_model_eval_per_step']:.4e}s")
+            print(
+                f"Time per step: {format_scalar(model_stats['avg_time_per_step'], precision=4)}s\t"
+                f"Time per epoch: {format_scalar(model_stats['avg_time_per_epoch'], precision=4)}s\t"
+                f"Peak active train-step memory: {format_scalar(model_stats['avg_max_memory_allocated'], precision=4)}GB\t"
+                f"Peak reserved train-step memory: {format_scalar(model_stats['avg_max_memory_reserved'], precision=4)}GB"
+            )
+            print(
+                f"Time per step (data fetching): {format_scalar(model_stats['avg_time_dataload_per_step'], precision=4)}s\t"
+                f"Time per step (model eval): {format_scalar(model_stats['avg_time_model_eval_per_step'], precision=4)}s"
+            )
 
             with open(os.path.join(ckpt_dir, 'model_stats.json'), 'w') as f:
                 json.dump(model_stats, f, indent=4)
@@ -146,8 +220,10 @@ class Callback:
             plt.xlabel('Step')
             plt.ylabel('Loss')
             plt.yscale('log')
-            if stat_vals['train_loss'] is not None:
-                plt.title(f'Train Loss (final): {stat_vals["train_loss"]:.2e}, Test Loss (final): {stat_vals["test_loss"]:.2e}')
+            train_final = stat_vals.get('train_loss')
+            test_final = stat_vals.get('test_loss')
+            if train_final is not None and test_final is not None:
+                plt.title(f'Train Loss (final): {train_final:.2e}, Test Loss (final): {test_final:.2e}')
             else:
                 plt.title('Train Loss')
             plt.grid(which='major', linestyle='-', linewidth=0.5, alpha=0.8)

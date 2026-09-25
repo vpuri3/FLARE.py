@@ -9,6 +9,7 @@ from datetime import timedelta
 import os
 import random
 import pathlib
+from typing import Callable, Optional
 
 __all__ = [
     # cache directory
@@ -17,11 +18,13 @@ __all__ = [
 
     # Sampler
     'RepeatBatchSampler',
+    'StepBudgetBatchSampler',
 
     # experiment management
     "get_next_exp_name",
 
     # device and seed
+    "configure_runtime",
     "set_seed",
     'set_num_threads',
     "select_device",
@@ -34,6 +37,11 @@ __all__ = [
 
     # model utility
     "num_parameters",
+
+    # normalization
+    "mean_std",
+    "normalize",
+    "unnormalize",
 
     # statistics
     "r2",
@@ -50,13 +58,17 @@ def dotdot(dir: str):
 
 def set_cache_path(BASE_DIR: str):
     CACHE_BASE = os.path.join(BASE_DIR, "cache")
+    # Inductor/Triton compile caches on NFS cause multi-job D-state hangs
+    # (open_last_lookups). Prefer node-local /tmp unless the caller already set them.
+    local_compile = os.path.join("/tmp", os.environ.get("USER", "user"), "flare_compile")
     env_vars = {
         "PIP_CACHE_DIR": os.path.join(CACHE_BASE, "pip"),
         "UV_CACHE_DIR": os.path.join(CACHE_BASE, "uv"),
         "XDG_CACHE_HOME": CACHE_BASE,
         "TORCH_HOME": os.path.join(CACHE_BASE, "torch"),
         "WANDB_CACHE_DIR": os.path.join(CACHE_BASE, "wandb"),
-        "TRITON_CACHE_DIR": os.path.join(CACHE_BASE, "triton"),
+        "TRITON_CACHE_DIR": os.path.join(local_compile, "triton"),
+        "TORCHINDUCTOR_CACHE_DIR": os.path.join(local_compile, "torchinductor"),
         "DATASETS_CACHE": os.path.join(CACHE_BASE, "datasets"),
         "MPLCONFIGDIR": os.path.join(CACHE_BASE, "matplotlib"),
         "HF_HOME": os.path.join(CACHE_BASE, "huggingface"),
@@ -66,6 +78,9 @@ def set_cache_path(BASE_DIR: str):
     }
 
     for var, path in env_vars.items():
+        if os.environ.get(var):
+            pathlib.Path(os.environ[var]).mkdir(parents=True, exist_ok=True)
+            continue
         os.environ[var] = str(path)
         pathlib.Path(path).mkdir(parents=True, exist_ok=True)
 
@@ -86,6 +101,40 @@ class RepeatBatchSampler(torch.utils.data.BatchSampler):
 
     def __len__(self):
         return len(self.batch_sampler) * self.repeat
+
+
+class StepBudgetBatchSampler(torch.utils.data.BatchSampler):
+    """Yield a fixed number of batches by cycling an inner batch sampler without restarting the DataLoader."""
+
+    def __init__(
+        self,
+        batch_sampler: torch.utils.data.BatchSampler,
+        total_batches: int,
+        sampler_for_epoch=None,
+        get_epoch: Optional[Callable[[], int]] = None,
+    ):
+        if total_batches < 1:
+            raise ValueError(f"total_batches must be >= 1. Got {total_batches}.")
+        self.batch_sampler = batch_sampler
+        self.total_batches = int(total_batches)
+        self.sampler_for_epoch = sampler_for_epoch
+        self.get_epoch = get_epoch
+
+    def __iter__(self):
+        count = 0
+        stream_epoch = int(self.get_epoch()) if self.get_epoch is not None else 0
+        while count < self.total_batches:
+            if self.sampler_for_epoch is not None and hasattr(self.sampler_for_epoch, "set_epoch"):
+                self.sampler_for_epoch.set_epoch(stream_epoch)
+            for batch in self.batch_sampler:
+                yield batch
+                count += 1
+                if count >= self.total_batches:
+                    return
+            stream_epoch += 1
+
+    def __len__(self):
+        return self.total_batches
 
 #=======================================================================#
 def get_next_exp_name(CASEDIR: str, exp_name: str):
@@ -151,17 +200,74 @@ def check_package_version_lteq(pkg: str, version: str):
         return False
 
 #=======================================================================#
-def set_seed(seed = 0):
+def configure_runtime(
+    seed: int = 0,
+    *,
+    mixed_precision: bool = True,
+    deterministic: bool = False,
+    compile_model: bool = False,
+) -> dict:
+    if deterministic and mixed_precision:
+        raise ValueError(
+            "run.deterministic=true is incompatible with training.mixed_precision=true. "
+            "Use mixed_precision=false (fp32 fidelity/strict) or disable deterministic."
+        )
+    if deterministic and compile_model:
+        raise ValueError(
+            "run.deterministic=true is incompatible with training.compile_model=true. "
+            "Set compile_model=false or disable deterministic."
+        )
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cuda.matmul.allow_tf32 = True
 
-    return
+    if deterministic:
+        profile = "strict"
+        allow_tf32 = False
+        cudnn_benchmark = False
+        cudnn_deterministic = True
+        use_det_algs = True
+    elif mixed_precision:
+        profile = "speed"
+        allow_tf32 = True
+        cudnn_benchmark = True
+        cudnn_deterministic = False
+        use_det_algs = False
+    else:
+        profile = "fidelity"
+        allow_tf32 = False
+        cudnn_benchmark = False
+        cudnn_deterministic = True
+        use_det_algs = False
+
+    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    torch.backends.cudnn.allow_tf32 = allow_tf32
+    if not allow_tf32:
+        torch.set_float32_matmul_precision("highest")
+    torch.backends.cudnn.benchmark = cudnn_benchmark
+    torch.backends.cudnn.deterministic = cudnn_deterministic
+    torch.use_deterministic_algorithms(use_det_algs)
+    if use_det_algs and "CUBLAS_WORKSPACE_CONFIG" not in os.environ:
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+    return {
+        "profile": profile,
+        "seed": int(seed),
+        "tf32": bool(allow_tf32),
+        "cudnn_benchmark": bool(cudnn_benchmark),
+        "cudnn_deterministic": bool(cudnn_deterministic),
+        "deterministic_algorithms": bool(use_det_algs),
+        "mixed_precision": bool(mixed_precision),
+        "compile_model": bool(compile_model),
+    }
+
+
+def set_seed(seed: int = 0, **kwargs):
+    """Seed RNGs and apply a runtime backend profile. Bare call ⇒ speed profile."""
+    return configure_runtime(seed, **kwargs)
 
 #=======================================================================#
 def set_num_threads(threads=None):
@@ -189,11 +295,12 @@ def select_device(device=None, verbose=False):
         LOCAL_RANK = int(os.environ['LOCAL_RANK'])
         return torch.device(LOCAL_RANK)
 
-    device = (
-        "cuda" if torch.cuda.is_available()
-        else "mps" if torch.backends.mps.is_available()
-        else "cpu"
-    )
+    if torch.cuda.is_available():
+        device = torch.device('cuda', torch.cuda.current_device())
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
 
     if verbose:
         print(f'using device {device}.')
@@ -212,7 +319,14 @@ def dist_backend():
 
 def is_torchrun():
     required_env_vars = ['LOCAL_RANK', 'RANK', 'WORLD_SIZE', 'MASTER_ADDR', 'MASTER_PORT']
-    return all(var in os.environ for var in required_env_vars)
+    if not all(var in os.environ for var in required_env_vars):
+        return False
+    if int(os.environ.get('WORLD_SIZE', '1')) <= 1:
+        return False
+    # Slurm steps may export torchrun-like vars without torchrun/elastic launch.
+    if 'TORCHELASTIC_RUN_ID' not in os.environ:
+        return False
+    return True
 
 def dist_setup():
     backend = dist_backend()
@@ -229,6 +343,15 @@ def dist_setup():
         GLOBAL_RANK = int(os.environ["RANK"])
         LOCAL_RANK = int(os.environ["LOCAL_RANK"])
         WORLD_SIZE = int(os.environ["WORLD_SIZE"])
+
+        # Avoid triton/inductor cache collisions across ranks
+        for cache_var in ["TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR"]:
+            base = os.environ.get(cache_var)
+            if base:
+                rank_dir = os.path.join(base, f"rank{LOCAL_RANK}")
+                if base != rank_dir and f"rank{LOCAL_RANK}" not in base:
+                    os.environ[cache_var] = rank_dir
+                    os.makedirs(rank_dir, exist_ok=True)
 
         torch.cuda.set_device(LOCAL_RANK)
         dist.init_process_group(
@@ -255,6 +378,24 @@ def get_module(model: nn.Module) -> nn.Module:
 #=======================================================================#
 def num_parameters(model : nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
+
+def mean_std(x: torch.tensor, channel_dim=-1):
+    dims = list(range(x.ndim))
+    del dims[channel_dim]
+    keepdim = (channel_dim != -1) and (channel_dim != x.ndim-1)
+
+    x_bar = x.mean(dims, keepdim=keepdim)
+    x_std = x.std( dims, keepdim=keepdim)
+
+    return x_bar, x_std
+
+def normalize(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
+    return (x - shift) / scale
+
+def unnormalize(x_norm: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
+    return x_norm * scale + shift
+
+#=======================================================================#
 
 def r2(y_pred, y_true):
     y_true = y_true.flatten()

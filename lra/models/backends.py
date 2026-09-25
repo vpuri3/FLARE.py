@@ -10,6 +10,7 @@ __all__ = [
 ]
 
 from .kernels import make_kernel
+from .transolver import TransolverBlock
 
 #======================================================================#
 # Vanilla Self-Attention Block
@@ -145,6 +146,7 @@ class LinformerAttention(nn.Module):
         num_heads: int,
         seq_len: int,
         k: int = 256,
+        share_kv: bool = False,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
         rope = None,
@@ -156,14 +158,14 @@ class LinformerAttention(nn.Module):
         assert channel_dim % num_heads == 0
         self.k = k
         self.max_length = seq_len
+        self.share_kv = share_kv
         self.rope = rope
 
         self.qkv_proj = nn.Linear(channel_dim, 3 * channel_dim)
         self.out_proj = nn.Linear(channel_dim, channel_dim)
 
-        # Shared projection over sequence dimension for K and V: [N, k]
         self.E_k = nn.Parameter(torch.randn(seq_len, k) * (self.head_dim ** -0.5))
-        self.E_v = nn.Parameter(torch.randn(seq_len, k) * (self.head_dim ** -0.5))
+        self.E_v = self.E_k if self.share_kv else nn.Parameter(torch.randn(seq_len, k) * (self.head_dim ** -0.5))
 
         self.scale = (self.head_dim ** -0.5)
 
@@ -208,6 +210,7 @@ class LinformerBlock(nn.Module):
         num_heads: int,
         seq_len: int,
         k: int = 256,
+        share_kv: bool = False,
         mlp_ratio: float = 4.0,
         act: str = None,
         rmsnorm: bool = False,
@@ -218,7 +221,16 @@ class LinformerBlock(nn.Module):
         super().__init__()
         self.norm1 = nn.RMSNorm(channel_dim) if rmsnorm else nn.LayerNorm(channel_dim)
         self.norm2 = nn.RMSNorm(channel_dim) if rmsnorm else nn.LayerNorm(channel_dim)
-        self.att = LinformerAttention(channel_dim, num_heads, seq_len=seq_len, k=k, attn_drop=attn_drop, proj_drop=proj_drop, rope=rope)
+        self.att = LinformerAttention(
+            channel_dim,
+            num_heads,
+            seq_len=seq_len,
+            k=k,
+            share_kv=share_kv,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            rope=rope,
+        )
         self.mlp = MLPBlock(channel_dim, int(channel_dim * mlp_ratio), channel_dim, act=act, drop=proj_drop)
 
     def forward(self, x, attention_mask=None):
@@ -546,11 +558,14 @@ class FLARE(nn.Module):
         num_latents: int = 32,
         act: str = None,
         attn_scale: float = 1.0,
+        q_norm: bool = False,
+        k_norm: bool = False,
         num_layers_kv_proj: int = 3,
         kv_proj_hidden_dim: int = 1.0,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
         rope = None,
+        rmsnorm: bool = False,
     ):
         super().__init__()
 
@@ -565,6 +580,10 @@ class FLARE(nn.Module):
 
         self.attn_drop_p = attn_drop
         self.proj_drop_p = proj_drop
+
+        Norm = nn.RMSNorm if rmsnorm else nn.LayerNorm
+        self.q_norm = Norm(self.head_dim) if q_norm else nn.Identity()
+        self.k_norm = Norm(self.head_dim) if k_norm else nn.Identity()
 
         assert self.channel_dim % self.num_heads == 0, f"channel_dim must be divisible by num_heads. Got {self.channel_dim} and {self.num_heads}."
 
@@ -595,7 +614,10 @@ class FLARE(nn.Module):
         q = self.latent_q.view(self.num_heads, self.num_latents, self.head_dim) # [H M D]
         k = rearrange(self.k_proj(x), 'b n (h d) -> b h n d', h=self.num_heads) # [B H N D]
         v = rearrange(self.v_proj(x), 'b n (h d) -> b h n d', h=self.num_heads)
-        
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
         if self.rope is not None:
             k = self.rope(k)
 
@@ -630,6 +652,8 @@ class FLAREBlock(nn.Module):
         act: str = None,
         rmsnorm: bool = False,
         attn_scale: float = 1.0,
+        q_norm: bool = False,
+        k_norm: bool = False,
         num_layers_kv_proj: int = 3,
         num_layers_ffn: int = 3,
         kv_proj_hidden_dim: int = 1.0,
@@ -647,8 +671,244 @@ class FLAREBlock(nn.Module):
             num_latents=num_latents,
             act=act,
             attn_scale=attn_scale,
+            q_norm=q_norm,
+            k_norm=k_norm,
             num_layers_kv_proj=num_layers_kv_proj,
             kv_proj_hidden_dim=kv_proj_hidden_dim,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            rope=rope,
+            rmsnorm=rmsnorm,
+        )
+        self.mlp = ResidualMLP(
+            in_dim=channel_dim,
+            hidden_dim=ffn_hidden_dim,
+            out_dim=channel_dim,
+            num_layers=num_layers_ffn,
+            act=act,
+            input_residual=True,
+            output_residual=True,
+        )
+
+    def forward(self, x, attention_mask=None):
+        # x: [B, N, C]
+
+        x = x + self.att(self.norm1(x), attention_mask=attention_mask)
+        x = x + self.mlp(self.norm2(x))
+
+        return x
+
+#======================================================================#
+# FLARE++ mixer helpers (match pdebench.models.flarepp, no CP)
+#======================================================================#
+def _flarepp_init_latent_queries(latent_q: nn.Parameter) -> None:
+    """Initialize latent_q with shape [H, M, D] via N(0, 0.02)."""
+    nn.init.normal_(latent_q, mean=0.0, std=0.02)
+
+
+def _flarepp_make_head_norm(
+    head_dim: int,
+    *,
+    enabled: bool,
+    rmsnorm: bool,
+    elementwise_affine: bool,
+) -> nn.Module:
+    if not enabled:
+        return nn.Identity()
+    if rmsnorm:
+        return nn.RMSNorm(head_dim, eps=1e-6, elementwise_affine=elementwise_affine)
+    return nn.LayerNorm(head_dim, elementwise_affine=elementwise_affine)
+
+
+def _flarepp_make_residual_linear_proj(channel_dim: int) -> nn.Linear:
+    proj = nn.Linear(channel_dim, channel_dim, bias=True)
+    with torch.no_grad():
+        noise = torch.empty_like(proj.weight)
+        nn.init.trunc_normal_(noise, mean=0.0, std=0.02, a=-2.0, b=2.0)
+        eye = torch.eye(channel_dim, dtype=proj.weight.dtype, device=proj.weight.device)
+        proj.weight.copy_(eye + noise)
+        proj.bias.zero_()
+    proj._skip_backbone_weight_init = True  # type: ignore[attr-defined]
+    return proj
+
+
+#======================================================================#
+# FLARE++ (input-dependent queries)
+#======================================================================#
+class FLAREPP(nn.Module):
+    def __init__(
+        self,
+        channel_dim: int,
+        num_heads: int = 8,
+        num_latents: int = 32,
+        k_norm: bool = True,
+        share_k0_v0: bool = True,
+        rmsnorm: bool = False,
+        q_fixed_norm: bool = True,
+        gate_logit_init: float = 0.25,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        rope = None,
+    ):
+        super().__init__()
+
+        for name, value in (
+            ("k_norm", k_norm),
+            ("share_k0_v0", share_k0_v0),
+            ("q_fixed_norm", q_fixed_norm),
+        ):
+            if not isinstance(value, bool):
+                raise TypeError(f"{name} must be bool, got {type(value).__name__}")
+        gate_logit_init = float(gate_logit_init)
+        if not math.isfinite(gate_logit_init):
+            raise ValueError(f"gate_logit_init must be finite, got {gate_logit_init}")
+
+        self.channel_dim = channel_dim
+        self.num_latents = num_latents
+        self.num_heads = channel_dim // 8 if num_heads is None else num_heads
+        self.head_dim = self.channel_dim // self.num_heads
+        self.share_k0_v0 = share_k0_v0
+        self.rope = rope
+        self.attn_drop_p = attn_drop
+        self.proj_drop_p = proj_drop
+
+        assert self.channel_dim % self.num_heads == 0, (
+            f"channel_dim must be divisible by num_heads. Got {self.channel_dim} and {self.num_heads}."
+        )
+
+        self.attn_scale = self.head_dim ** -0.5
+
+        self.latent_q0 = nn.Parameter(torch.empty(self.num_heads, self.num_latents, self.head_dim))
+        _flarepp_init_latent_queries(self.latent_q0)
+
+        self.gate_logit = nn.Parameter(torch.full((self.num_heads,), gate_logit_init))
+        self.latent_q_fixed = nn.Parameter(torch.empty(self.num_heads, self.num_latents, self.head_dim))
+        _flarepp_init_latent_queries(self.latent_q_fixed)
+
+        # Hop-1 norms always on: q0 keeps affine; k0 matches v0 (no affine).
+        self.q0_norm = _flarepp_make_head_norm(
+            self.head_dim, enabled=True, rmsnorm=rmsnorm, elementwise_affine=True
+        )
+        self.k0_norm = _flarepp_make_head_norm(
+            self.head_dim, enabled=True, rmsnorm=rmsnorm, elementwise_affine=False
+        )
+        self.v0_norm = _flarepp_make_head_norm(
+            self.head_dim, enabled=True, rmsnorm=rmsnorm, elementwise_affine=False
+        )
+        self.k_norm = _flarepp_make_head_norm(
+            self.head_dim, enabled=k_norm, rmsnorm=rmsnorm, elementwise_affine=True
+        )
+        self.q_fixed_norm = _flarepp_make_head_norm(
+            self.head_dim, enabled=q_fixed_norm, rmsnorm=rmsnorm, elementwise_affine=False
+        )
+
+        self.k0_proj = _flarepp_make_residual_linear_proj(self.channel_dim)
+        self.v0_proj = (
+            _flarepp_make_residual_linear_proj(self.channel_dim)
+            if not self.share_k0_v0
+            else None
+        )
+        self.k_proj = _flarepp_make_residual_linear_proj(self.channel_dim)
+        self.v_proj = _flarepp_make_residual_linear_proj(self.channel_dim)
+
+        self.out_proj = nn.Linear(self.channel_dim, self.channel_dim)
+
+    def flare_encode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: torch.Tensor = None,
+        dropout_p: float = 0.0,
+    ) -> torch.Tensor:
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, scale=self.attn_scale, dropout_p=dropout_p,
+        )
+
+    def flare_decode(
+        self,
+        k: torch.Tensor,
+        q: torch.Tensor,
+        z: torch.Tensor,
+        attn_mask: torch.Tensor = None,
+        dropout_p: float = 0.0,
+    ) -> torch.Tensor:
+        q = q.to(dtype=z.dtype)
+        k = k.to(dtype=z.dtype)
+        return F.scaled_dot_product_attention(
+            k, q, z, attn_mask=attn_mask, scale=self.attn_scale, dropout_p=dropout_p,
+        )
+
+    def forward(self, x, attention_mask=None):
+        drop_attn_p = self.attn_drop_p if self.training else 0.0
+        drop_proj_p = self.proj_drop_p if self.training else 0.0
+
+        batch_size = x.size(0)
+        num_heads = self.num_heads
+        mask_enc, mask_dec = FLARE.get_mask(attention_mask)
+
+        q0 = self.q0_norm(self.latent_q0.unsqueeze(0).expand(batch_size, -1, -1, -1))
+        k0 = self.k0_norm(rearrange(self.k0_proj(x), "b n (h d) -> b h n d", h=num_heads))
+        if not self.share_k0_v0:
+            v0 = self.v0_norm(rearrange(self.v0_proj(x), "b n (h d) -> b h n d", h=num_heads))
+        else:
+            v0 = k0
+
+        if self.rope is not None:
+            k0 = self.rope(k0)
+
+        k = rearrange(self.k_proj(x), "b n (h d) -> b h n d", h=num_heads)
+        v = rearrange(self.v_proj(x), "b n (h d) -> b h n d", h=num_heads)
+
+        q_dynamic = self.flare_encode(q0, k0, v0, attn_mask=mask_enc, dropout_p=drop_attn_p)
+        qf = self.latent_q_fixed.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        qf = self.q_fixed_norm(qf)
+        qf_f = qf.float()
+        qd_f = q_dynamic.float()
+        g = torch.sigmoid(self.gate_logit).float().view(1, num_heads, 1, 1)
+        q = (qf_f + g * qd_f).to(dtype=x.dtype)
+        k = self.k_norm(k)
+        if self.rope is not None:
+            k = self.rope(k)
+
+        z = self.flare_encode(q, k, v, attn_mask=mask_enc, dropout_p=drop_attn_p)
+        y = self.flare_decode(k, q, z, attn_mask=mask_dec, dropout_p=drop_attn_p)
+
+        y = rearrange(y, "b h n d -> b n (h d)")
+        y = self.out_proj(y)
+        y = F.dropout(y, p=drop_proj_p, inplace=True)
+        return y
+
+class FLAREPPBlock(nn.Module):
+    def __init__(
+        self,
+        channel_dim: int,
+        num_heads: int = None,
+        num_latents: int = None,
+        act: str = None,
+        rmsnorm: bool = False,
+        num_layers_ffn: int = 3,
+        ffn_hidden_dim: int = 1.0,
+        k_norm: bool = True,
+        share_k0_v0: bool = True,
+        q_fixed_norm: bool = True,
+        gate_logit_init: float = 0.25,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        rope = None,
+    ):
+        super().__init__()
+        self.norm1 = nn.RMSNorm(channel_dim, eps=1e-6) if rmsnorm else nn.LayerNorm(channel_dim)
+        self.norm2 = nn.RMSNorm(channel_dim, eps=1e-6) if rmsnorm else nn.LayerNorm(channel_dim)
+        self.att = FLAREPP(
+            channel_dim=channel_dim,
+            num_heads=num_heads,
+            num_latents=num_latents,
+            k_norm=k_norm,
+            share_k0_v0=share_k0_v0,
+            rmsnorm=rmsnorm,
+            q_fixed_norm=q_fixed_norm,
+            gate_logit_init=gate_logit_init,
             attn_drop=attn_drop,
             proj_drop=proj_drop,
             rope=rope,
@@ -687,8 +947,8 @@ class LinearAttention(nn.Module):
         channel_dim: int,
         num_heads: int,
         kernel: str = 'silu',
-        norm_q: bool = False,
-        norm_k: bool = False,
+        q_norm: bool = False,
+        k_norm: bool = False,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
         rope = None,
@@ -706,8 +966,8 @@ class LinearAttention(nn.Module):
 
         self.kernel = make_kernel(kernel, head_dim=self.head_dim)
 
-        self.norm_q = norm_q
-        self.norm_k = norm_k
+        self.q_norm = q_norm
+        self.k_norm = k_norm
 
     def forward(self, x, attention_mask=None):
         B, N, C = x.shape
@@ -720,8 +980,8 @@ class LinearAttention(nn.Module):
         q = self.kernel(q)
         k = self.kernel(k)
         
-        q = q / (q.norm(dim=-1, keepdim=True) + 1e-6) if self.norm_q else q
-        k = k / (k.norm(dim=-1, keepdim=True) + 1e-6) if self.norm_k else k
+        q = q / (q.norm(dim=-1, keepdim=True) + 1e-6) if self.q_norm else q
+        k = k / (k.norm(dim=-1, keepdim=True) + 1e-6) if self.k_norm else k
 
         # Apply attention mask if provided
         if attention_mask is not None:
@@ -753,8 +1013,8 @@ class LinearAttentionBlock(nn.Module):
         rmsnorm: bool = False,
         mlp_ratio: float = 4.0,
         kernel: str = 'silu',
-        norm_q: bool = False,
-        norm_k: bool = False,
+        q_norm: bool = False,
+        k_norm: bool = False,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
         rope = None,
@@ -762,7 +1022,7 @@ class LinearAttentionBlock(nn.Module):
         super().__init__()
         self.norm1 = nn.RMSNorm(channel_dim) if rmsnorm else nn.LayerNorm(channel_dim)
         self.norm2 = nn.RMSNorm(channel_dim) if rmsnorm else nn.LayerNorm(channel_dim)
-        self.att = LinearAttention(channel_dim, num_heads, kernel=kernel, norm_q=norm_q, norm_k=norm_k, attn_drop=attn_drop, proj_drop=proj_drop, rope=rope)
+        self.att = LinearAttention(channel_dim, num_heads, kernel=kernel, q_norm=q_norm, k_norm=k_norm, attn_drop=attn_drop, proj_drop=proj_drop, rope=rope)
         self.mlp = MLPBlock(channel_dim, int(channel_dim * mlp_ratio), channel_dim, act=act, drop=proj_drop)
 
     def forward(self, x, attention_mask=None):
@@ -784,8 +1044,8 @@ class MultilinearAttention(nn.Module):
         num_layers_kv_proj: int = -1,
         kv_proj_mlp_ratio: float = 1.0,
         kernel: str = 'identity',
-        norm_q: bool = False,
-        norm_k: bool = False,
+        q_norm: bool = False,
+        k_norm: bool = False,
         qk_dim_ratio: float = 1.0,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
@@ -827,8 +1087,8 @@ class MultilinearAttention(nn.Module):
 
         self.kernel = make_kernel(kernel, head_dim=self.head_dim, qk_dim=self.qk_dim)
 
-        self.norm_q = norm_q
-        self.norm_k = norm_k
+        self.q_norm = q_norm
+        self.k_norm = k_norm
         self.norm = nn.RMSNorm(channel_dim) if rmsnorm else nn.LayerNorm(channel_dim)
 
     def forward(self, x, attention_mask=None):
@@ -851,8 +1111,8 @@ class MultilinearAttention(nn.Module):
         ks = self.kernel(ks)
 
         # normalize
-        q = q / (q.norm(dim=-1, keepdim=True) + 1e-6) if self.norm_q else q
-        ks = ks / (ks.norm(dim=-1, keepdim=True) + 1e-6) if self.norm_k else ks
+        q = q / (q.norm(dim=-1, keepdim=True) + 1e-6) if self.q_norm else q
+        ks = ks / (ks.norm(dim=-1, keepdim=True) + 1e-6) if self.k_norm else ks
 
         # Apply attention mask if provided
         if attention_mask is not None:
@@ -902,8 +1162,8 @@ class MultilinearBlock(nn.Module):
         num_layers_ffn: int = 0,
         ffn_mlp_ratio: float = 4.0,
         kernel: str = 'identity',
-        norm_q: bool = False,
-        norm_k: bool = False,
+        q_norm: bool = False,
+        k_norm: bool = False,
         qk_dim_ratio: float = 1.0,
         #
         attn_drop: float = 0.0,
@@ -916,7 +1176,7 @@ class MultilinearBlock(nn.Module):
         self.att = MultilinearAttention(
             channel_dim, num_heads, act=act, rmsnorm=rmsnorm,
             num_states=num_states, num_layers_kv_proj=num_layers_kv_proj, kv_proj_mlp_ratio=kv_proj_mlp_ratio,
-            kernel=kernel, norm_q=norm_q, norm_k=norm_k, qk_dim_ratio=qk_dim_ratio,
+            kernel=kernel, q_norm=q_norm, k_norm=k_norm, qk_dim_ratio=qk_dim_ratio,
             attn_drop=attn_drop, proj_drop=proj_drop, rope=rope,
         )
         self.mlp = ResidualMLP(
@@ -928,6 +1188,48 @@ class MultilinearBlock(nn.Module):
         x = x + self.att(self.norm1(x), attention_mask=attention_mask)
         x = x + self.mlp(self.norm2(x))
         return x
+
+
+class NormAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        channel_dim: int,
+        num_heads: int,
+        act: str = None,
+        rmsnorm: bool = False,
+        mlp_ratio: float = 4.0,
+        num_layers_kv_proj: int = -1,
+        kv_proj_mlp_ratio: float = 1.0,
+        num_layers_ffn: int = 0,
+        ffn_mlp_ratio: float = 4.0,
+        qk_dim_ratio: float = 1.0,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        rope = None,
+    ):
+        super().__init__()
+        del mlp_ratio
+        self.block = MultilinearBlock(
+            channel_dim=channel_dim,
+            num_heads=num_heads,
+            act=act,
+            rmsnorm=rmsnorm,
+            num_states=1,
+            num_layers_kv_proj=num_layers_kv_proj,
+            kv_proj_mlp_ratio=kv_proj_mlp_ratio,
+            num_layers_ffn=num_layers_ffn,
+            ffn_mlp_ratio=ffn_mlp_ratio,
+            kernel='identity',
+            q_norm=True,
+            k_norm=True,
+            qk_dim_ratio=qk_dim_ratio,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            rope=rope,
+        )
+
+    def forward(self, x, attention_mask=None):
+        return self.block(x, attention_mask=attention_mask)
 
 #======================================================================#
 # Linearized Strassen Attention
@@ -942,8 +1244,8 @@ class StrassenAttention(nn.Module):
         num_layers_kv_proj: int = -1,
         kv_proj_mlp_ratio: float = 1.0,
         kernel: str = 'identity',
-        norm_q: bool = False,
-        norm_k: bool = False,
+        q_norm: bool = False,
+        k_norm: bool = False,
         qk_dim_ratio: float = 1.0,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
@@ -974,8 +1276,8 @@ class StrassenAttention(nn.Module):
 
         self.kernel = make_kernel(kernel, head_dim=self.head_dim, qk_dim=self.qk_dim)
 
-        self.norm_q = norm_q
-        self.norm_k = norm_k
+        self.q_norm = q_norm
+        self.k_norm = k_norm
         self.norm = nn.RMSNorm(channel_dim) if rmsnorm else nn.LayerNorm(channel_dim)
 
         # gates
@@ -1004,8 +1306,8 @@ class StrassenAttention(nn.Module):
         q, k1, k2 = [self.kernel(z) for z in [q, k1, k2]]
 
         # normalize
-        q = q / (q.norm(dim=-1, keepdim=True) + 1e-6) if self.norm_q else q
-        k1, k2 = [z / (z.norm(dim=-1, keepdim=True) + 1e-6) if self.norm_k else z for z in [k1, k2]]
+        q = q / (q.norm(dim=-1, keepdim=True) + 1e-6) if self.q_norm else q
+        k1, k2 = [z / (z.norm(dim=-1, keepdim=True) + 1e-6) if self.k_norm else z for z in [k1, k2]]
 
         # Apply attention mask if provided
         if attention_mask is not None:
@@ -1062,8 +1364,8 @@ class StrassenBlock(nn.Module):
         num_layers_ffn: int = 0,
         ffn_mlp_ratio: float = 4.0,
         kernel: str = 'identity',
-        norm_q: bool = False,
-        norm_k: bool = False,
+        q_norm: bool = False,
+        k_norm: bool = False,
         qk_dim_ratio: float = 1.0,
         #
         attn_drop: float = 0.0,
@@ -1076,7 +1378,7 @@ class StrassenBlock(nn.Module):
         self.att = StrassenAttention(
             channel_dim, num_heads, act=act, rmsnorm=rmsnorm,
             num_layers_kv_proj=num_layers_kv_proj, kv_proj_mlp_ratio=kv_proj_mlp_ratio,
-            kernel=kernel, norm_q=norm_q, norm_k=norm_k, qk_dim_ratio=qk_dim_ratio,
+            kernel=kernel, q_norm=q_norm, k_norm=k_norm, qk_dim_ratio=qk_dim_ratio,
             attn_drop=attn_drop, proj_drop=proj_drop, rope=rope,
         )
         self.mlp = ResidualMLP(
@@ -1202,8 +1504,8 @@ class TripleAttention(nn.Module):
         num_layers_kv_proj: int = -1,
         kv_proj_mlp_ratio: float = 1.0,
         kernel: str = 'identity',
-        norm_q: bool = False,
-        norm_k: bool = False,
+        q_norm: bool = False,
+        k_norm: bool = False,
         qk_dim_ratio: float = 1.0,
         use_triton: bool = False,
         attn_drop: float = 0.0,
@@ -1234,8 +1536,8 @@ class TripleAttention(nn.Module):
 
         self.kernel = make_kernel(kernel, head_dim=self.head_dim, qk_dim=self.qk_dim)
 
-        self.norm_q = norm_q
-        self.norm_k = norm_k
+        self.q_norm = q_norm
+        self.k_norm = k_norm
         self.norm = nn.RMSNorm(channel_dim) if rmsnorm else nn.LayerNorm(channel_dim)
 
         from .triton.triple import TripleAttentionFunction
@@ -1258,8 +1560,8 @@ class TripleAttention(nn.Module):
         q1, q2, k1, k2 = [self.kernel(z) for z in [q1, q2, k1, k2]]
 
         # normalize
-        q1, q2 = [z / (z.norm(dim=-1, keepdim=True) + 1e-6) if self.norm_q else z for z in [q1, q2]]
-        k1, k2 = [z / (z.norm(dim=-1, keepdim=True) + 1e-6) if self.norm_k else z for z in [k1, k2]]
+        q1, q2 = [z / (z.norm(dim=-1, keepdim=True) + 1e-6) if self.q_norm else z for z in [q1, q2]]
+        k1, k2 = [z / (z.norm(dim=-1, keepdim=True) + 1e-6) if self.k_norm else z for z in [k1, k2]]
 
         # Apply attention mask if provided
         if attention_mask is not None:
@@ -1304,8 +1606,8 @@ class TripleBlock(nn.Module):
         num_layers_ffn: int = 0,
         ffn_mlp_ratio: float = 4.0,
         kernel: str = 'identity',
-        norm_q: bool = False,
-        norm_k: bool = False,
+        q_norm: bool = False,
+        k_norm: bool = False,
         qk_dim_ratio: float = 1.0,
         use_triton: bool = False,
         #
@@ -1319,7 +1621,7 @@ class TripleBlock(nn.Module):
         self.att = TripleAttention(
             channel_dim, num_heads, act=act, rmsnorm=rmsnorm,
             num_layers_kv_proj=num_layers_kv_proj, kv_proj_mlp_ratio=kv_proj_mlp_ratio,
-            kernel=kernel, norm_q=norm_q, norm_k=norm_k, qk_dim_ratio=qk_dim_ratio, use_triton=use_triton,
+            kernel=kernel, q_norm=q_norm, k_norm=k_norm, qk_dim_ratio=qk_dim_ratio, use_triton=use_triton,
             attn_drop=attn_drop, proj_drop=proj_drop, rope=rope,
         )
         self.mlp = ResidualMLP(
@@ -1507,8 +1809,8 @@ class QuadAttention(nn.Module):
         num_layers_kv_proj: int = -1,
         kv_proj_mlp_ratio: float = 1.0,
         kernel: str = 'identity',
-        norm_q: bool = False,
-        norm_k: bool = False,
+        q_norm: bool = False,
+        k_norm: bool = False,
         qk_dim_ratio: float = 1.0,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
@@ -1541,8 +1843,8 @@ class QuadAttention(nn.Module):
 
         self.kernel = make_kernel(kernel, head_dim=self.head_dim, qk_dim=self.qk_dim)
 
-        self.norm_q = norm_q
-        self.norm_k = norm_k
+        self.q_norm = q_norm
+        self.k_norm = k_norm
         self.norm = nn.RMSNorm(channel_dim) if rmsnorm else nn.LayerNorm(channel_dim)
 
     def forward(self, x, attention_mask=None):
@@ -1566,8 +1868,8 @@ class QuadAttention(nn.Module):
         q1, q2, q3, k1, k2, k3 = [self.kernel(z) for z in [q1, q2, q3, k1, k2, k3]]
 
         # normalize
-        q1, q2, q3 = [z / (z.norm(dim=-1, keepdim=True) + 1e-6) if self.norm_q else z for z in [q1, q2, q3]]
-        k1, k2, k3 = [z / (z.norm(dim=-1, keepdim=True) + 1e-6) if self.norm_k else z for z in [k1, k2, k3]]
+        q1, q2, q3 = [z / (z.norm(dim=-1, keepdim=True) + 1e-6) if self.q_norm else z for z in [q1, q2, q3]]
+        k1, k2, k3 = [z / (z.norm(dim=-1, keepdim=True) + 1e-6) if self.k_norm else z for z in [k1, k2, k3]]
 
         # Apply attention mask if provided
         if attention_mask is not None:
@@ -1608,8 +1910,8 @@ class QuadBlock(nn.Module):
         num_layers_ffn: int = 0,
         ffn_mlp_ratio: float = 4.0,
         kernel: str = 'identity',
-        norm_q: bool = False,
-        norm_k: bool = False,
+        q_norm: bool = False,
+        k_norm: bool = False,
         qk_dim_ratio: float = 1.0,
         #
         attn_drop: float = 0.0,
@@ -1622,7 +1924,7 @@ class QuadBlock(nn.Module):
         self.att = QuadAttention(
             channel_dim, num_heads, act=act, rmsnorm=rmsnorm,
             num_layers_kv_proj=num_layers_kv_proj, kv_proj_mlp_ratio=kv_proj_mlp_ratio,
-            kernel=kernel, norm_q=norm_q, norm_k=norm_k, qk_dim_ratio=qk_dim_ratio,
+            kernel=kernel, q_norm=q_norm, k_norm=k_norm, qk_dim_ratio=qk_dim_ratio,
             attn_drop=attn_drop, proj_drop=proj_drop, rope=rope,
         )
         self.mlp = ResidualMLP(
@@ -1756,12 +2058,19 @@ class ThirdOrderAttentionBlock(nn.Module):
 # Performer Attention
 #======================================================================#
 
-def _draw_gaussian_projection_matrix(num_heads: int, nb_features: int, head_dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """Generates a Gaussian random projection matrix for FAVOR+."""
-    matrix = torch.randn(num_heads, nb_features, head_dim, device=device, dtype=dtype)
-    # Normalize rows for numerical stability.
-    matrix = torch.nn.functional.normalize(matrix, dim=-1)
-    return matrix
+def _draw_orthogonal_projection_matrix(num_heads: int, nb_features: int, head_dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Generates orthogonal random features for FAVOR-style attention."""
+    blocks = []
+    for _ in range(num_heads):
+        rows = []
+        remaining = nb_features
+        while remaining > 0:
+            block = torch.randn(head_dim, head_dim, device=device, dtype=dtype)
+            q, _ = torch.linalg.qr(block, mode="reduced")
+            rows.append(q.mT[: min(head_dim, remaining)])
+            remaining -= head_dim
+        blocks.append(torch.cat(rows, dim=0))
+    return torch.stack(blocks, dim=0)
 
 class PerformerAttention(nn.Module):
     def __init__(
@@ -1769,6 +2078,7 @@ class PerformerAttention(nn.Module):
         channel_dim: int,
         num_heads: int,
         nb_features: int = 256,
+        feature_map: str = "favor_plus",
         redraw_interval: int = 0,
         normalize_inputs: bool = True,
         attn_drop: float = 0.0,
@@ -1782,6 +2092,7 @@ class PerformerAttention(nn.Module):
         assert channel_dim % num_heads == 0, f"channel_dim must be divisible by num_heads. Got {channel_dim} and {num_heads}."
 
         self.nb_features = nb_features
+        self.feature_map = feature_map
         self.redraw_interval = redraw_interval
         self.normalize_inputs = normalize_inputs
         self.attn_drop = nn.Dropout(attn_drop)
@@ -1793,8 +2104,11 @@ class PerformerAttention(nn.Module):
         self.eps = 1e-6
         self.data_normalizer = (self.head_dim ** -0.25) if self.normalize_inputs else 1.0
 
-        proj = _draw_gaussian_projection_matrix(num_heads, nb_features, self.head_dim, device=torch.device('cpu'), dtype=torch.float32)
-        self.register_buffer('proj_matrix', proj, persistent=False)
+        if self.feature_map not in ["favor_plus", "favor_pp"]:
+            raise ValueError(f"Unsupported performer feature_map: {self.feature_map}.")
+
+        proj = _draw_orthogonal_projection_matrix(num_heads, self.nb_features, self.head_dim, device=torch.device('cpu'), dtype=torch.float32)
+        self.register_buffer('proj_matrix', proj)
         self.register_buffer('_feature_redraw_counter', torch.zeros(1, dtype=torch.long), persistent=False)
 
     def _maybe_redraw_features(self):
@@ -1803,27 +2117,76 @@ class PerformerAttention(nn.Module):
         self._feature_redraw_counter += 1
         if self._feature_redraw_counter.item() % self.redraw_interval == 0:
             with torch.no_grad():
-                new_proj = _draw_gaussian_projection_matrix(
-                    self.num_heads, self.nb_features, self.head_dim,
+                new_proj = _draw_orthogonal_projection_matrix(
+                    self.num_heads, self.proj_matrix.size(1), self.head_dim,
                     device=self.proj_matrix.device, dtype=self.proj_matrix.dtype
                 )
                 self.proj_matrix.copy_(new_proj)
 
-    def _feature_map(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, H, N, D]
-        proj = self.proj_matrix.to(device=x.device)
-        x = x.to(torch.float32)
-        proj = proj.to(torch.float32)
-        x = x * self.data_normalizer
-        x_proj = torch.einsum('b h n d, h m d -> b h n m', x, proj)
-        # Stabilize exponentials
-        squared_norms = (x.pow(2).sum(dim=-1, keepdim=True)) / 2.0
-        x_proj = x_proj - squared_norms
-        max_val, _ = torch.max(x_proj, dim=-1, keepdim=True)
-        x_proj = x_proj - max_val
-        features = torch.exp(x_proj) + self.eps
-        features = features / math.sqrt(self.nb_features)
-        return features
+    def _compute_oprf_params(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Compute the OPRF/FAVOR++ heuristic from CRT Theorem 3.3 using
+        # average ||x_i + y_j||^2 over the current attention batch.
+        if attention_mask is None:
+            valid = torch.ones(q.size(0), 1, q.size(2), device=q.device, dtype=q.dtype)
+        else:
+            valid = attention_mask.view(q.size(0), 1, q.size(2)).to(dtype=q.dtype, device=q.device)
+
+        count = valid.sum(dim=-1, keepdim=True).clamp_min(1.0)  # [B, 1, 1]
+        q_sq = (q.pow(2).sum(dim=-1) * valid).sum(dim=-1, keepdim=True) / count  # [B, H, 1]
+        k_sq = (k.pow(2).sum(dim=-1) * valid).sum(dim=-1, keepdim=True) / count  # [B, H, 1]
+
+        q_sum = (q * valid.unsqueeze(-1)).sum(dim=2)  # [B, H, D]
+        k_sum = (k * valid.unsqueeze(-1)).sum(dim=2)  # [B, H, D]
+        pair_dot = (q_sum * k_sum).sum(dim=-1, keepdim=True) / (count * count)  # [B, H, 1]
+        t = (q_sq + k_sq + 2.0 * pair_dot).clamp_min(0.0)  # [B, H, 1]
+
+        d = torch.tensor(float(self.head_dim), device=q.device, dtype=q.dtype)
+        rho = torch.ones_like(t)
+        nonzero = t > self.eps
+        numer = torch.sqrt((2.0 * t + d).pow(2) + 8.0 * d * t) - 2.0 * t - d
+        rho_est = numer / (4.0 * t.clamp_min(self.eps))
+        rho = torch.where(nonzero, rho_est.clamp_min(self.eps).clamp_max(1.0), rho)
+
+        a_star = (1.0 - rho.reciprocal()) / 8.0  # [B, H, 1]
+        b_star = torch.sqrt((1.0 - 4.0 * a_star).clamp_min(self.eps))
+        log_d_star = 0.25 * d * torch.log((1.0 - 4.0 * a_star).clamp_min(self.eps))
+        return a_star.unsqueeze(-1), b_star.unsqueeze(-1), log_d_star.unsqueeze(-1)
+
+    def _feature_map(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # q, k: [B, H, N, D]
+        proj = self.proj_matrix.to(device=q.device, dtype=torch.float32)
+        q = q.to(torch.float32) * self.data_normalizer
+        k = k.to(torch.float32) * self.data_normalizer
+
+        q_proj = torch.einsum('b h n d, h m d -> b h n m', q, proj)
+        k_proj = torch.einsum('b h n d, h m d -> b h n m', k, proj)
+        q_sq = q.pow(2).sum(dim=-1, keepdim=True) / 2.0
+        k_sq = k.pow(2).sum(dim=-1, keepdim=True) / 2.0
+
+        if self.feature_map == "favor_plus":
+            q_logits = q_proj - q_sq
+            k_logits = k_proj - k_sq
+        else:
+            a_star, b_star, log_d_star = self._compute_oprf_params(q, k, attention_mask)
+            proj_norm_sq = proj.pow(2).sum(dim=-1).view(1, self.num_heads, 1, self.nb_features)
+            q_logits = log_d_star + a_star * proj_norm_sq + b_star * q_proj - q_sq
+            k_logits = log_d_star + a_star * proj_norm_sq + b_star * k_proj - k_sq
+
+        q_logits = q_logits - q_logits.max(dim=-1, keepdim=True).values
+        k_logits = k_logits - k_logits.max(dim=-1, keepdim=True).values
+        q_features = (torch.exp(q_logits) + self.eps) / math.sqrt(self.nb_features)
+        k_features = (torch.exp(k_logits) + self.eps) / math.sqrt(self.nb_features)
+        return q_features, k_features
 
     def forward(self, x, attention_mask=None):
         # x: [B, N, C]
@@ -1838,8 +2201,7 @@ class PerformerAttention(nn.Module):
             k = self.rope(k)
 
         out_dtype = q.dtype
-        q_prime = self._feature_map(q)
-        k_prime = self._feature_map(k)
+        q_prime, k_prime = self._feature_map(q, k, attention_mask)
         v = v.to(torch.float32)
 
         # Apply attention mask if provided (after feature map transformation)
@@ -1869,6 +2231,7 @@ class PerformerBlock(nn.Module):
         act: str = None,
         rmsnorm: bool = False,
         nb_features: int = 256,
+        feature_map: str = "favor_plus",
         redraw_interval: int = 0,
         normalize_inputs: bool = True,
         mlp_ratio: float = 4.0,
@@ -1883,6 +2246,7 @@ class PerformerBlock(nn.Module):
             channel_dim=channel_dim,
             num_heads=num_heads,
             nb_features=nb_features,
+            feature_map=feature_map,
             redraw_interval=redraw_interval,
             normalize_inputs=normalize_inputs,
             attn_drop=attn_drop,
@@ -1898,12 +2262,234 @@ class PerformerBlock(nn.Module):
 
 
 #======================================================================#
+# Cosformer Attention
+#======================================================================#
+class CosformerAttention(nn.Module):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        kdim: int = None,
+        vdim: int = None,
+        dropout_rate: float = 0.0,
+        proj_drop: float = 0.0,
+        causal: bool = False,
+        has_outproj: bool = True,
+        act_fun: str = "relu",
+        rope = None,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.kdim = kdim if kdim is not None else embed_dim
+        self.vdim = vdim if vdim is not None else embed_dim
+        self.num_heads = num_heads
+        self.has_outproj = has_outproj
+        self.act_fun = self.get_act_fun(act_fun)
+        self.dropout_rate = dropout_rate
+        self.causal = causal
+        self.rope = rope
+
+        assert self.embed_dim % self.num_heads == 0, "embed_dim must be divisible by num_heads"
+
+        self.head_dim = self.embed_dim // self.num_heads
+        self.k_proj = nn.Linear(self.kdim, embed_dim)
+        self.v_proj = nn.Linear(self.vdim, embed_dim)
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.attn_drop = nn.Dropout(dropout_rate)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def get_index(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        index = (math.pi / 2) * torch.arange(1, seq_len + 1, device=device, dtype=dtype)
+        return index.view(1, 1, seq_len, 1)
+
+    def get_act_fun(self, act_fun: str):
+        if act_fun == "relu":
+            return F.relu
+        if act_fun == "elu":
+            return lambda x: 1 + F.elu(x)
+        raise ValueError(f"Unsupported cosformer activation: {act_fun}.")
+
+    def _reshape_heads(self, x: torch.Tensor) -> torch.Tensor:
+        return rearrange(x, "b n (h d) -> b h n d", h=self.num_heads)
+
+    def _feature_map(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tgt_len = q.size(2)
+        src_len = k.size(2)
+        m = max(src_len, tgt_len)
+        weight_index = self.get_index(m, device=q.device, dtype=torch.float32)
+        q_angle = weight_index[:, :, :tgt_len] / m
+        k_angle = weight_index[:, :, :src_len] / m
+        q_ = torch.cat([q * torch.sin(q_angle), q * torch.cos(q_angle)], dim=-1)
+        k_ = torch.cat([k * torch.sin(k_angle), k * torch.cos(k_angle)], dim=-1)
+        return q_, k_
+
+    def _mask_tensors(
+        self,
+        q_: torch.Tensor,
+        k_: torch.Tensor,
+        v: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        if attention_mask is None:
+            return q_, k_, v, None
+
+        mask = attention_mask[:, None, :, None].to(dtype=q_.dtype, device=q_.device)
+        return q_ * mask, k_ * mask, v * mask, mask
+
+    def _project(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        value: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        key = query if key is None else key
+        value = query if value is None else value
+
+        q = self._reshape_heads(self.q_proj(query))
+        k = self._reshape_heads(self.k_proj(key))
+        v = self._reshape_heads(self.v_proj(value))
+
+        q = q.to(torch.float32)
+        k = k.to(torch.float32)
+        v = v.to(torch.float32)
+
+        if self.rope is not None:
+            q = self.rope(q)
+            k = self.rope(k)
+
+        q = self.act_fun(q)
+        k = self.act_fun(k)
+        return q, k, v
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        value: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        out_dtype = query.dtype
+        q, k, v = self._project(query, key=key, value=value)
+        q_, k_ = self._feature_map(q, k)
+        q_, k_, v, mask = self._mask_tensors(q_, k_, v, attention_mask)
+
+        if self.causal:
+            kv = torch.einsum("b h n m, b h n d -> b h n m d", k_, v)
+            kv_cum = torch.cumsum(kv, dim=2)
+            numerator = torch.einsum("b h n m, b h n m d -> b h n d", q_, kv_cum)
+            k_cum = torch.cumsum(k_, dim=2)
+            denominator = torch.clamp_min(torch.einsum("b h n m, b h n m -> b h n", q_, k_cum), eps)
+        else:
+            kv = torch.einsum("b h n m, b h n d -> b h m d", k_, v)
+            k_sum = k_.sum(dim=2)
+            numerator = torch.einsum("b h n m, b h m d -> b h n d", q_, kv)
+            denominator = torch.clamp_min(torch.einsum("b h n m, b h m -> b h n", q_, k_sum), eps)
+
+        attn_output = numerator / denominator.unsqueeze(-1)
+        if mask is not None:
+            attn_output = attn_output * mask
+        attn_output = self.attn_drop(attn_output)
+        attn_output = rearrange(attn_output, "b h n d -> b n (h d)").to(out_dtype)
+
+        if self.has_outproj:
+            attn_output = self.out_proj(attn_output)
+        attn_output = self.proj_drop(attn_output)
+        return attn_output
+
+    def left_product(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        value: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        out_dtype = query.dtype
+        q, k, v = self._project(query, key=key, value=value)
+        q_, k_ = self._feature_map(q, k)
+        q_, k_, v, mask = self._mask_tensors(q_, k_, v, attention_mask)
+
+        weights = torch.einsum("b h l d, b h s d -> b h l s", q_, k_)
+        if self.causal:
+            causal_mask = torch.triu(
+                torch.ones(
+                    weights.size(-2),
+                    weights.size(-1),
+                    device=weights.device,
+                    dtype=torch.bool,
+                ),
+                diagonal=1,
+            )
+            weights = weights.masked_fill(causal_mask.view(1, 1, weights.size(-2), weights.size(-1)), 0.0)
+        if mask is not None:
+            weights = weights * mask.squeeze(-1).unsqueeze(2)
+
+        denominator = torch.clamp_min(weights.sum(dim=-1, keepdim=True), eps)
+        attn_weights = weights / denominator
+        attn_output = torch.einsum("b h l s, b h s d -> b h l d", attn_weights, v)
+        if mask is not None:
+            attn_output = attn_output * mask
+        attn_output = rearrange(attn_output, "b h n d -> b n (h d)").to(out_dtype)
+
+        if self.has_outproj:
+            attn_output = self.out_proj(attn_output)
+        attn_output = self.proj_drop(attn_output)
+        return attn_output
+
+
+class CosformerBlock(nn.Module):
+    def __init__(
+        self,
+        channel_dim: int,
+        num_heads: int,
+        act: str = None,
+        rmsnorm: bool = False,
+        mlp_ratio: float = 4.0,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        causal: bool = False,
+        has_outproj: bool = True,
+        act_fun: str = "relu",
+        rope = None,
+    ):
+        super().__init__()
+        self.norm1 = nn.RMSNorm(channel_dim) if rmsnorm else nn.LayerNorm(channel_dim)
+        self.norm2 = nn.RMSNorm(channel_dim) if rmsnorm else nn.LayerNorm(channel_dim)
+        self.att = CosformerAttention(
+            embed_dim=channel_dim,
+            num_heads=num_heads,
+            dropout_rate=attn_drop,
+            proj_drop=proj_drop,
+            causal=causal,
+            has_outproj=has_outproj,
+            act_fun=act_fun,
+            rope=rope,
+        )
+        self.mlp = MLPBlock(in_dim=channel_dim, hidden_dim=int(channel_dim * mlp_ratio), out_dim=channel_dim, act=act, drop=proj_drop)
+
+    def forward(self, x, attention_mask=None):
+        x = x + self.att(self.norm1(x), attention_mask=attention_mask)
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+#======================================================================#
 MODEL_TYPES = {
     'transformer': SelfAttentionBlock,
+    'transolver': TransolverBlock,
     'flare': FLAREBlock,
+    'flarepp': FLAREPPBlock,
+    'cosformer': CosformerBlock,
     'linformer': LinformerBlock,
     'linear': LinearAttentionBlock,
     'multilinear': MultilinearBlock,
+    'normattention': NormAttentionBlock,
     'triple': TripleBlock,
     'triple1': Triple1Block,
     'quad': QuadBlock,

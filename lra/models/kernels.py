@@ -87,7 +87,7 @@ class HedgehogFeatureMap(nn.Module):
     Hedgehog feature map as introduced in
     `The Hedgehog & the Porcupine: Expressive Linear Attentions with Softmax Mimicry <https://arxiv.org/abs/2402.04347>`_
     """
-    def __init__(self, head_dim: int):
+    def __init__(self, head_dim: int, qk_dim: int = None):
         super().__init__()
         self.layer = nn.Linear(head_dim, head_dim)
         self.init_weights_()
@@ -101,7 +101,9 @@ class HedgehogFeatureMap(nn.Module):
 
     def forward(self, x: torch.Tensor):
         x = self.layer(x)  # shape b, h, l, d
-        return torch.cat([2*x, -2*x], dim=-1).softmax(-1)
+        logits = torch.cat([2 * x, -2 * x], dim=-1)
+        # Run the softmax in fp32 for mixed-precision stability, then cast back.
+        return logits.float().softmax(-1).to(x.dtype)
 
 # class DPFPFeatureMap(nn.Module):
 

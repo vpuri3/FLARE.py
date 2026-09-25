@@ -4,10 +4,32 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from einops import rearrange
+from dataclasses import dataclass
+from typing import Optional
 
 __all__ = [
     "FLAREExperimentalModel",
 ]
+
+@dataclass
+class FlareExperimentalConfig:
+    model: str = "flare_experimental"
+    num_blocks: int = 8
+    channel_dim: int = 64
+    num_heads: int = 8
+    act: Optional[str] = None
+    rmsnorm: bool = False
+    out_proj_norm: bool = True
+    num_layers_in_out_proj: int = 2
+    num_layers_k_proj: int = 3
+    num_layers_v_proj: int = 3
+    k_proj_mlp_ratio: float = 1.0
+    v_proj_mlp_ratio: float = 1.0
+    num_layers_ffn: int = 3
+    ffn_mlp_ratio: float = 1.0
+    qk_norm: bool = False
+    attn_scale: str = "one"
+    num_latents: int = 64
 
 #======================================================================#
 # FLARE
@@ -155,28 +177,36 @@ class FLAREExperimentalBlock(nn.Module):
 # MODEL
 #======================================================================#
 class FLAREExperimentalModel(nn.Module):
-    def __init__(self,
-        in_dim: int,
-        out_dim: int,
-        channel_dim: int = 64,
-        num_blocks: int = 8,
-        num_heads: int = None,
-        act: str = None,
-        rmsnorm: bool = False,
-        out_proj_norm: bool = True,
-        num_layers_in_out_proj: int = 2,
-        #
-        attn_scale: float = 1.0,
-        num_latents: int = None,
-        num_layers_k_proj: int = 3,
-        num_layers_v_proj: int = 3,
-        k_proj_mlp_ratio: float = 1.0,
-        v_proj_mlp_ratio: float = 1.0,
-        num_layers_ffn: int = 3,
-        ffn_mlp_ratio: float = 1.0,
-        qk_norm: bool = False,
-    ):
+    def __init__(self, config: FlareExperimentalConfig, metadata=None):
         super().__init__()
+        metadata = {} if metadata is None else dict(metadata)
+        in_dim = int(metadata.get("c_in", metadata.get("point_input_dim", 1)))
+        out_dim = int(metadata.get("c_out", 1))
+        channel_dim = int(config.channel_dim)
+        num_blocks = int(config.num_blocks)
+        num_heads = int(config.num_heads)
+        act = "gelu" if config.act is None else config.act
+        rmsnorm = bool(config.rmsnorm)
+        out_proj_norm = bool(config.out_proj_norm)
+        num_layers_in_out_proj = int(config.num_layers_in_out_proj)
+        attn_scale = getattr(config, "attn_scale", 1.0)
+        if isinstance(attn_scale, str):
+            if attn_scale not in {"sqrt", "one"}:
+                raise ValueError(f"Invalid attn_scale: {attn_scale}. Choose from: sqrt, one.")
+            head_dim = channel_dim // num_heads
+            if head_dim > 16:
+                attn_scale = "sqrt"
+            attn_scale = (head_dim ** -0.5) if attn_scale == "sqrt" else 1.0
+        else:
+            attn_scale = float(attn_scale)
+        num_latents = int(config.num_latents)
+        num_layers_k_proj = int(config.num_layers_k_proj)
+        num_layers_v_proj = int(config.num_layers_v_proj)
+        k_proj_mlp_ratio = float(config.k_proj_mlp_ratio)
+        v_proj_mlp_ratio = float(config.v_proj_mlp_ratio)
+        num_layers_ffn = int(config.num_layers_ffn)
+        ffn_mlp_ratio = float(config.ffn_mlp_ratio)
+        qk_norm = bool(config.qk_norm)
 
         self.in_proj = ResidualMLP(
             in_dim=in_dim,

@@ -53,9 +53,11 @@ class Hydra(nn.Module):
         self.expand = expand
         self.d_inner = self.expand * self.d_model
         self.headdim = headdim
-        self.ngroups = ngroups
         assert self.d_inner % self.headdim == 0
         self.nheads = self.d_inner // self.headdim
+        self.ngroups = min(ngroups, self.nheads)
+        while self.ngroups > 1 and self.nheads % self.ngroups != 0:
+            self.ngroups -= 1
         self.dt_limit = dt_limit
         self.learnable_init_states = learnable_init_states
         self.activation = activation

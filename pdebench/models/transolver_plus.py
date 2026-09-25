@@ -1,5 +1,10 @@
 #
+# Adapted from:
 # https://github.com/thuml/Transolver_plus/blob/main/models/Transolver_plus.py
+#
+# This repo keeps the upstream architecture but intentionally uses the local
+# PDEBench single-tensor `forward(x)` interface instead of the upstream
+# `(x, pos, condition)` API.
 import torch
 import numpy as np
 import torch.nn as nn
@@ -8,10 +13,27 @@ from einops import rearrange
 import torch.distributed.nn as dist_nn
 from torch.utils.checkpoint import checkpoint
 import torch.nn.functional as F
+from typing import Optional
+
+from dataclasses import dataclass
+
+from ..distributed.context_parallel import ContextParallelState
 
 __all__ = [
     "TransolverPlusPlus",
 ]
+
+@dataclass
+class TransolverPlusPlusConfig:
+    model: str = "transolver++"
+    num_blocks: int = 8
+    channel_dim: int = 64
+    num_heads: int = 8
+    act: Optional[str] = None
+    rmsnorm: bool = False
+    mlp_ratio: float = 4.0
+    num_slices: int = 64
+
 
 ACTIVATION = {'gelu': nn.GELU, 'tanh': nn.Tanh, 'sigmoid': nn.Sigmoid, 'relu': nn.ReLU, 'leaky_relu': nn.LeakyReLU(0.1),
               'softplus': nn.Softplus, 'ELU': nn.ELU, 'silu': nn.SiLU}
@@ -24,7 +46,10 @@ def matmul_single(fx_mid, slice_weights):
 
 def gumbel_softmax(logits, tau=1, hard=False):
     u = torch.rand_like(logits)
-    gumbel_noise = -torch.log(-torch.log(u + 1e-8) + 1e-8)
+    # Keep U strictly inside (0, 1) so nested logs stay finite in low precision.
+    finfo = torch.finfo(u.dtype)
+    u = torch.clamp(u, min=finfo.tiny, max=1.0 - finfo.eps)
+    gumbel_noise = -torch.log(-torch.log(u))
 
     y = logits + gumbel_noise
     y = y / tau
@@ -65,6 +90,10 @@ class Physics_Attention_1D_Eidetic(nn.Module):
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout)
         )
+        self.cp_state: Optional[ContextParallelState] = None
+
+    def set_context_parallel(self, cp_state: Optional[ContextParallelState]):
+        self.cp_state = cp_state
     
     def forward(self, x):
         # B N C
@@ -76,11 +105,12 @@ class Physics_Attention_1D_Eidetic(nn.Module):
         temperature = self.proj_temperature(x_mid) + self.bias
         temperature = torch.clamp(temperature, min=0.01)
         slice_weights = gumbel_softmax(self.in_project_slice(x_mid), temperature)
-        slice_norm = slice_weights.sum(2)  # B H G
-        # dist_nn.all_reduce(slice_norm, op=dist_nn.ReduceOp.SUM)
+        slice_norm = slice_weights.sum(2, keepdim=False).unsqueeze(-1)  # B H G 1
         slice_token = torch.einsum("bhnc,bhng->bhgc", x_mid, slice_weights).contiguous()
-        # dist_nn.all_reduce(slice_token, op=dist_nn.ReduceOp.SUM)
-        slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
+        if self.cp_state is not None and self.cp_state.cp_size > 1:
+            slice_norm = dist_nn.all_reduce(slice_norm, op=dist_nn.ReduceOp.SUM, group=self.cp_state.cp_group)
+            slice_token = dist_nn.all_reduce(slice_token, op=dist_nn.ReduceOp.SUM, group=self.cp_state.cp_group)
+        slice_token = slice_token / (slice_norm + 1e-5)
 
         q_slice_token = self.to_q(slice_token)
         k_slice_token = self.to_k(slice_token)
@@ -133,25 +163,30 @@ class Transolver_plus_block(nn.Module):
             last_layer=False,
             out_dim=1,
             slice_num=32,
+            rmsnorm: bool = False,
     ):
         super().__init__()
         self.last_layer = last_layer
-        self.ln_1 = nn.LayerNorm(hidden_dim)
+        Norm = nn.RMSNorm if rmsnorm else nn.LayerNorm
+        self.ln_1 = Norm(hidden_dim)
         self.Attn = Physics_Attention_1D_Eidetic(hidden_dim, heads=num_heads, dim_head=hidden_dim // num_heads,
                                          dropout=dropout, slice_num=slice_num)
-        self.ln_2 = nn.LayerNorm(hidden_dim)
+        self.ln_2 = Norm(hidden_dim)
         self.mlp = MLP(hidden_dim, int(hidden_dim * mlp_ratio), hidden_dim, n_layers=0, res=False, act=act)
         if self.last_layer:
-            self.ln_3 = nn.LayerNorm(hidden_dim)
+            self.ln_3 = Norm(hidden_dim)
             self.mlp2 = nn.Linear(hidden_dim, out_dim)
+
+    def set_context_parallel(self, cp_state: Optional[ContextParallelState]):
+        self.Attn.set_context_parallel(cp_state)
 
     def forward(self, fx):
         if self.training:
-            fx = checkpoint(self.Attn, self.ln_1(fx), use_reentrant=True) + fx
+            fx = checkpoint(self.Attn, self.ln_1(fx), use_reentrant=False) + fx
         else:
-            fx += self.Attn(self.ln_1(fx))
+            fx = fx + self.Attn(self.ln_1(fx))
         if self.training:
-            fx = checkpoint(self.mlp, self.ln_2(fx), use_reentrant=True) + fx
+            fx = checkpoint(self.mlp, self.ln_2(fx), use_reentrant=False) + fx
         else:
             fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
@@ -163,21 +198,22 @@ class Transolver_plus_block(nn.Module):
 # Transolver_plus
 #======================================================================#
 class TransolverPlusPlus(nn.Module):
-    def __init__(self,
-                 space_dim=1,
-                 n_layers=5,
-                 n_hidden=256,
-                 dropout=0,
-                 n_head=8,
-                 act='gelu',
-                 mlp_ratio=1,
-                 fun_dim=1,
-                 out_dim=1,
-                 slice_num=32,
-                 ref=8,
-                 unified_pos=False
-                 ):
+    def __init__(self, config: TransolverPlusPlusConfig, metadata=None):
         super(TransolverPlusPlus, self).__init__()
+        metadata = {} if metadata is None else dict(metadata)
+        space_dim = int(metadata.get("space_dim", metadata.get("c_in", 1)))
+        fun_dim = int(metadata.get("fun_dim", 1))
+        out_dim = int(metadata.get("c_out", 1))
+        n_layers = int(config.num_blocks)
+        n_hidden = int(config.channel_dim)
+        dropout = float(getattr(config, "dropout", 0.0))
+        n_head = int(config.num_heads)
+        act = "gelu" if config.act is None else config.act
+        mlp_ratio = float(config.mlp_ratio)
+        slice_num = int(config.num_slices)
+        ref = int(getattr(config, "ref", 8))
+        unified_pos = bool(getattr(config, "unified_pos", False))
+        rmsnorm = bool(config.rmsnorm)
         self.__name__ = 'UniPDE_3D'
         self.ref = ref
         self.unified_pos = unified_pos
@@ -196,10 +232,12 @@ class TransolverPlusPlus(nn.Module):
                                                       mlp_ratio=mlp_ratio,
                                                       out_dim=out_dim,
                                                       slice_num=slice_num,
+                                                      rmsnorm=rmsnorm,
                                                       last_layer=(_ == n_layers - 1))
                                      for _ in range(n_layers)])
         self.initialize_weights()
         self.placeholder = nn.Parameter((1 / (n_hidden)) * torch.rand(n_hidden, dtype=torch.float))
+        self.cp_state: Optional[ContextParallelState] = None
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -212,6 +250,12 @@ class TransolverPlusPlus(nn.Module):
         elif isinstance(m, (nn.LayerNorm, nn.BatchNorm1d)):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
+
+    def set_context_parallel(self, cp_state: Optional[ContextParallelState], cp_debug_gather_outputs: bool = False):
+        del cp_debug_gather_outputs
+        self.cp_state = cp_state
+        for block in self.blocks:
+            block.set_context_parallel(cp_state)
 
     def get_grid(self, my_pos):
         # my_pos 1 N 3

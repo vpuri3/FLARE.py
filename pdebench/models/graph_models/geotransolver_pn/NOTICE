@@ -1,0 +1,19 @@
+PhysicsNeMo GeoTransolver / GALE (vendored)
+
+This directory contains code adapted from NVIDIA PhysicsNeMo:
+
+  https://github.com/NVIDIA/physicsnemo
+  path: physicsnemo/experimental/models/geotransolver/
+
+Upstream license: Apache License 2.0
+Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
+
+Local adaptations in this tree:
+  - Replace Warp ``BQWarp`` / ``radius_search`` with a pure-PyTorch ball query
+    (``ball_query.py``) that matches the BQWarp pad-to-K contract.
+  - Strip PhysicsNeMo ``Module`` / ``ModelMetaData``, OOD guard, Transformer
+    Engine, ConcreteDropout, and structured-mesh / GALE_FA paths.
+  - Keep GALE + context projector math for the irregular-mesh path.
+
+See individual file SPDX headers. Full Apache-2.0 text:
+  https://www.apache.org/licenses/LICENSE-2.0

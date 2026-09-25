@@ -1,6 +1,8 @@
 #
+import gc
 import math
 import time
+from typing import TYPE_CHECKING
 import torch
 from torch import nn, optim
 from torch import distributed as dist
@@ -17,12 +19,34 @@ from typing import Union, List, Optional, Callable, Any, Tuple
 from mlutils.utils import (
     num_parameters, select_device, is_torchrun,
     RepeatBatchSampler,
+    StepBudgetBatchSampler,
 )
 from mlutils.ema import *
+from mlutils.metrics import format_metric, normalize_metric, unset_metric
+
+if TYPE_CHECKING:
+    from mlutils.run_timer import RunTimer
 
 __all__ = [
     'Trainer',
 ]
+
+
+def _safe_one_cycle_pct_start(pct_start: float, total_steps: int) -> float:
+    min_pct_start = (1.0 + 1e-6) / max(1, total_steps)
+    return max(pct_start, min_pct_start)
+
+
+class _DDPStatsModelProxy(nn.Module):
+    """Expose an eager module through `.module` for stats functions that unwrap DDP."""
+
+    def __init__(self, module: nn.Module):
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
 
 #======================================================================#
 class Trainer:
@@ -33,11 +57,14 @@ class Trainer:
         data_: Optional[Any] = None,  # Must be iterable (Dataset, PyG Dataset, etc.)
 
         gnn_loader: bool = False,
+        graph_loader_backend: Optional[str] = None,  # 'pyg' or 'dgl' when gnn_loader=True
         device: Optional[Union[str, torch.device]] = None,
         mixed_precision: bool = False,
+        amp_dtype: Optional[str] = None,  # fp16, bf16, or None (use torch.autocast default)
 
         # compilation
         compile_model: bool = True,
+        compile_stats_model: bool = True,
         static_graph: bool = False,
         
         # EMA
@@ -51,10 +78,13 @@ class Trainer:
         num_workers: int = 0,
         prefetch_factor: Optional[int] = None,
 
-        _batch_size: Optional[int] = None,  # bwd over _data
-        batch_size_: Optional[int] = None,  # fwd over data_
-        _batch_size_: Optional[int] = None, # fwd over _data
+        _batch_size: Optional[int] = None,  # global train batch (graphs/step); see batch_size_is_per_rank
+        batch_size_: Optional[int] = None,  # global eval batch on train split
+        _batch_size_: Optional[int] = None,  # global eval batch on train split (alias)
         repeat_train_batch: int = 1,
+        schedule_step_multiplier: int = 1,
+        batch_size_is_per_rank: bool = False,  # if False (default), _batch_size is global and divided by WORLD_SIZE
+        use_distributed_sampler: bool = True,
 
         # collate function (on host)
         _collate_fn: Optional[Callable] = None,
@@ -87,6 +117,11 @@ class Trainer:
         one_cycle_base_momentum: float = 0.85,
         one_cycle_max_momentum: float = 0.95,
         one_cycle_anneal_strategy: str = 'cos',
+        warmup_epochs: int = 0,
+        warmup_steps: int = 0,
+        min_lr: float = 0.0,
+        plateau_factor: float = 0.7,
+        plateau_patience: int = 10,
 
         lossfun: Optional[Callable] = None,
         batch_lossfun: Optional[Callable] = None, # (trainer, model, batch) -> loss
@@ -97,8 +132,14 @@ class Trainer:
         verbose: bool = True,
         print_iterator: bool = True,
         stats_every: Optional[int] = None, # stats every k epochs/ steps based on train_based_on_epochs
+        stats_on_start: bool = True,
+        fullbatch_stats_on_start: bool = False,
         _fullbatch_stats: bool = True,
         fullbatch_stats_: bool = True,
+        log_rank_every_steps: int = 0,
+        overlap_train_dataloader: bool = True,
+        continuous_train_batches: Optional[bool] = None,
+        run_timer: Optional["RunTimer"] = None,
     ):
 
         ###
@@ -127,18 +168,46 @@ class Trainer:
 
         self.verbose = verbose
         self.print_iterator = print_iterator and self.verbose and (self.GLOBAL_RANK == 0)
+        self.stats_on_start = bool(stats_on_start)
+        self.fullbatch_stats_on_start = bool(fullbatch_stats_on_start)
+        self.run_timer = run_timer
+        self._first_train_step_marked = False
+        self._statistics_timing_marked = False
 
         ###
         # PRECISION & ATTENTION BACKEND
         ###
 
         self.mixed_precision = mixed_precision
-        self.auto_cast = torch.autocast(device_type=self.device_type, enabled=self.mixed_precision)
-        self.grad_scaler = torch.amp.GradScaler(device=self.device_type, enabled=self.mixed_precision)
+        self.amp_dtype = None
+        if amp_dtype is not None:
+            amp_dtype_value = str(amp_dtype).lower()
+            if amp_dtype_value in ['fp16', 'float16', 'half']:
+                self.amp_dtype = torch.float16
+            elif amp_dtype_value in ['bf16', 'bfloat16']:
+                self.amp_dtype = torch.bfloat16
+            else:
+                raise ValueError(f"Invalid amp_dtype: {amp_dtype}. Choose from: fp16, bf16, or None.")
+
+        autocast_kwargs = dict(device_type=self.device_type, enabled=self.mixed_precision)
+        if self.mixed_precision and self.amp_dtype is not None:
+            autocast_kwargs['dtype'] = self.amp_dtype
+        self.auto_cast = torch.autocast(**autocast_kwargs)
+
+        self.effective_amp_dtype = self.amp_dtype
+        if self.mixed_precision and self.effective_amp_dtype is None:
+            try:
+                self.effective_amp_dtype = torch.get_autocast_dtype(self.device_type)
+            except Exception:
+                self.effective_amp_dtype = None
+
+        # GradScaler is only needed for fp16 CUDA AMP.
+        use_grad_scaler = self.mixed_precision and (self.device_type == 'cuda') and (self.effective_amp_dtype == torch.float16)
+        self.grad_scaler = torch.amp.GradScaler(device=self.device_type, enabled=use_grad_scaler)
         
         if self.mixed_precision:
             if self.verbose and (self.GLOBAL_RANK == 0):
-                print(f"Mixed precision training enabled.")
+                print(f"Mixed precision training enabled with autocast dtype={self.effective_amp_dtype}.")
 
         ###
         # DATA
@@ -150,16 +219,19 @@ class Trainer:
         self._data = _data
         self.data_ = data_
 
-        self._batch_size = self.WORLD_SIZE if _batch_size is None else _batch_size    # training batch size
+        self._batch_size = self.WORLD_SIZE if _batch_size is None else _batch_size  # global training batch size
         self._batch_size_ = self._batch_size * 2 if _batch_size_ is None else _batch_size_ # validation batch size on training data
         self.batch_size_ = self._batch_size * 2 if batch_size_ is None else batch_size_ # validation batch size on test data
         self.drop_last_batch = drop_last_batch
         self.repeat_train_batch = max(1, repeat_train_batch)
+        self.schedule_step_multiplier = max(1, int(schedule_step_multiplier))
+        self.batch_size_is_per_rank = bool(batch_size_is_per_rank)
+        self.use_distributed_sampler = bool(use_distributed_sampler)
 
-        assert self._batch_size % self.WORLD_SIZE == 0, f"Batch size {self._batch_size} must be divisible by world size {self.WORLD_SIZE}."
+        if not self.batch_size_is_per_rank:
+            assert self._batch_size % self.WORLD_SIZE == 0, f"Batch size {self._batch_size} must be divisible by world size {self.WORLD_SIZE}."
 
-        self.num_workers = min(num_workers, self._batch_size, os.cpu_count() // self.WORLD_SIZE)
-        self.num_workers = max(self.num_workers, 0)
+        self.num_workers = max(int(num_workers), 0)
         self.prefetch_factor = prefetch_factor if self.num_workers > 0 else None
 
         self._collate_fn = _collate_fn
@@ -168,13 +240,26 @@ class Trainer:
         self._preprocess_fn = _preprocess_fn
         self.preprocess_fn_ = preprocess_fn_ if preprocess_fn_ is not None else _preprocess_fn
 
-        self.gnn_loader = gnn_loader
+        self.gnn_loader = bool(gnn_loader)
+        if self.gnn_loader:
+            backend = "pyg" if graph_loader_backend is None else str(graph_loader_backend).lower()
+            if backend not in {"pyg", "dgl"}:
+                raise ValueError(
+                    f"Invalid graph_loader_backend='{graph_loader_backend}'. "
+                    "Choose one of: pyg, dgl."
+                )
+            self.graph_loader_backend = backend
+        else:
+            self.graph_loader_backend = None
 
         ###
         # MODEL
         ###
 
         self.model = model.to(self.device)
+        self._eager_model = self.model
+        self._uses_compiled_model = False
+        self.compile_stats_model = bool(compile_stats_model)
 
         if compile_model:
 
@@ -183,14 +268,17 @@ class Trainer:
 
             try:
                 self.model = torch.compile(self.model)
+                self._uses_compiled_model = True
                 if self.verbose and (self.GLOBAL_RANK == 0):
                     print(f"Compilation successful.")
+                self._timing_mark("trainer_compile")
             except Exception as e:
                 if self.verbose and (self.GLOBAL_RANK == 0):
                     print(f"Compilation failed ({type(e).__name__}: {e}). Running without compile.")
         else:
             if self.verbose and (self.GLOBAL_RANK == 0):
                 print("Compilation disabled (compile_model=False).")
+            self._timing_mark("trainer_compile_skipped")
 
         if self.DDP:
             ddp_kwargs = {
@@ -269,8 +357,13 @@ class Trainer:
                 self.steps_per_epoch = math.ceil(steps_per_epoch) * self.repeat_train_batch
             self.steps = self.steps_per_epoch * self.epochs
 
+        self.schedule_steps_per_epoch = self.steps_per_epoch * self.schedule_step_multiplier \
+            if self.train_based_on_epochs else None
+        self.schedule_total_steps = self.steps * self.schedule_step_multiplier
+
         self.step = 0
         self.epoch = 0
+        self.reduce_lr_on_plateau = False
 
         ###
         # Learning rate scheduler
@@ -279,6 +372,10 @@ class Trainer:
         ###
 
         if Schedule == "OneCycleLR":
+            one_cycle_total_steps = self.schedule_total_steps if not self.train_based_on_epochs else (
+                self.epochs * self.schedule_steps_per_epoch
+            )
+            one_cycle_pct_start = _safe_one_cycle_pct_start(one_cycle_pct_start, one_cycle_total_steps)
             one_cycle_args = dict(
                 max_lr=lr,
                 pct_start=one_cycle_pct_start,
@@ -292,18 +389,55 @@ class Trainer:
             )
             if self.train_based_on_epochs:
                 one_cycle_args['epochs'] = self.epochs
-                one_cycle_args['steps_per_epoch'] = self.steps_per_epoch
+                one_cycle_args['steps_per_epoch'] = self.schedule_steps_per_epoch
             else:
-                one_cycle_args['total_steps'] = self.steps
+                one_cycle_args['total_steps'] = self.schedule_total_steps
 
             self.schedule = optim.lr_scheduler.OneCycleLR(self.opt, **one_cycle_args)
+            self.update_schedule_every_epoch = False
+        elif Schedule == "CosineAnnealingLR":
+            total_steps = max(1, int(self.schedule_total_steps))
+            warmup_total_steps = int(warmup_steps or 0)
+            if warmup_total_steps <= 0 and warmup_epochs and self.train_based_on_epochs:
+                warmup_total_steps = int(max(0, warmup_epochs) * max(1, self.schedule_steps_per_epoch))
+            warmup_total_steps = max(0, min(warmup_total_steps, total_steps - 1))
+
+            if warmup_total_steps > 0:
+                # Warm up from a small LR to base LR, then cosine decay to min_lr.
+                warmup = optim.lr_scheduler.LinearLR(
+                    self.opt,
+                    start_factor=1.0 / float(warmup_total_steps),
+                    end_factor=1.0,
+                    total_iters=warmup_total_steps,
+                )
+                cosine = optim.lr_scheduler.CosineAnnealingLR(
+                    self.opt,
+                    T_max=max(1, total_steps - warmup_total_steps),
+                    eta_min=float(min_lr or 0.0),
+                )
+                self.schedule = optim.lr_scheduler.SequentialLR(
+                    self.opt,
+                    schedulers=[warmup, cosine],
+                    milestones=[warmup_total_steps],
+                )
+            else:
+                self.schedule = optim.lr_scheduler.CosineAnnealingLR(
+                    self.opt,
+                    T_max=total_steps,
+                    eta_min=float(min_lr or 0.0),
+                )
             self.update_schedule_every_epoch = False
         elif Schedule == "CosineAnnealingWarmRestarts":
             self.schedule = optim.lr_scheduler.CosineAnnealingWarmRestarts(self.opt, T_0=self.epochs, T_mult=1, eta_min=0.)
             self.update_schedule_every_epoch = True
-        elif Schedule == "CosineAnnealingLR":
-            self.schedule = optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=self.epochs, eta_min=0.)
+        elif Schedule == "ReduceLROnPlateau":
+            self.schedule = optim.lr_scheduler.ReduceLROnPlateau(
+                self.opt,
+                factor=plateau_factor,
+                patience=plateau_patience,
+            )
             self.update_schedule_every_epoch = True
+            self.reduce_lr_on_plateau = True
         elif Schedule is None:
             self.schedule = optim.lr_scheduler.ConstantLR(self.opt, factor=1.0, total_iters=1e10)
             self.update_schedule_every_epoch = True
@@ -340,6 +474,10 @@ class Trainer:
         self.time_dataload_per_step = []
         self.time_model_eval_per_step = []
         self.memory_utilization = []
+        self.memory_allocated = []
+        self.memory_reserved = []
+        self.max_memory_allocated = []
+        self.max_memory_reserved = []
 
         self.grad_norm_per_step = []
         self.learning_rates_per_step = [[] for _ in range(len(self.opt.param_groups))]
@@ -351,6 +489,11 @@ class Trainer:
 
         self._fullbatch_stats = _fullbatch_stats
         self.fullbatch_stats_ = fullbatch_stats_
+        self.log_rank_every_steps = max(0, int(log_rank_every_steps or 0))
+        self.overlap_train_dataloader = bool(overlap_train_dataloader)
+        self.continuous_train_batches = continuous_train_batches
+        self._use_continuous_train_batches = False
+        self._batches_per_train_epoch = 1
 
         ###
         # Callbacks
@@ -374,6 +517,25 @@ class Trainer:
     def trigger_callbacks(self, event: str):
         for callback in self.callbacks[event]:
             callback(self)
+
+    def _timing_mark(self, name: str) -> None:
+        if self.run_timer is not None:
+            self.run_timer.mark(name)
+
+    def _eval_fullbatch(self, loader, *, enabled: bool, split: str) -> Tuple[Any, dict]:
+        if not enabled or loader is None:
+            return unset_metric(), {}
+        loss, stats = self.call_statsfun(loader, split=split)
+        return normalize_metric(loss), stats
+
+    def _run_train_start(self) -> None:
+        """Optional startup stats plus callback hooks (preserves step-0 batch_end behavior)."""
+        self.trigger_callbacks("epoch_start")
+        self.trigger_callbacks("batch_start")
+        if self.stats_on_start:
+            self.statistics()
+        self.trigger_callbacks("batch_end")
+        self.trigger_callbacks("epoch_end")
 
     #------------------------#
     # SAVE / LOAD
@@ -423,6 +585,10 @@ class Trainer:
         snapshot['time_dataload_per_step'] = self.time_dataload_per_step
         snapshot['time_model_eval_per_step'] = self.time_model_eval_per_step
         snapshot['memory_utilization'] = self.memory_utilization
+        snapshot['memory_allocated'] = self.memory_allocated
+        snapshot['memory_reserved'] = self.memory_reserved
+        snapshot['max_memory_allocated'] = self.max_memory_allocated
+        snapshot['max_memory_reserved'] = self.max_memory_reserved
 
         snapshot['grad_norm_per_step'] = self.grad_norm_per_step
         snapshot['learning_rates_per_step'] = self.learning_rates_per_step
@@ -509,6 +675,10 @@ class Trainer:
         self.time_dataload_per_step = snapshot['time_dataload_per_step']
         self.time_model_eval_per_step = snapshot['time_model_eval_per_step']
         self.memory_utilization = snapshot['memory_utilization']
+        self.memory_allocated = snapshot.get('memory_allocated', [])
+        self.memory_reserved = snapshot.get('memory_reserved', [])
+        self.max_memory_allocated = snapshot.get('max_memory_allocated', self.memory_utilization)
+        self.max_memory_reserved = snapshot.get('max_memory_reserved', [])
 
         self.grad_norm_per_step = snapshot['grad_norm_per_step']
         self.learning_rates_per_step = snapshot['learning_rates_per_step']
@@ -527,21 +697,27 @@ class Trainer:
         # Fix dataloader
         ###
         if self.gnn_loader:
-            import torch_geometric as pyg
-            DL = pyg.loader.DataLoader
+            if self.graph_loader_backend == "pyg":
+                import torch_geometric as pyg
+                DL = pyg.loader.DataLoader
+            elif self.graph_loader_backend == "dgl":
+                from dgl.dataloading import GraphDataLoader
+                DL = GraphDataLoader
+            else:
+                raise ValueError(f"Unsupported graph loader backend: {self.graph_loader_backend}")
         else:
             DL = torch.utils.data.DataLoader
 
         ###
         # Sampler
         ###
-        if self.DDP:
+        if self.DDP and self.use_distributed_sampler:
             _sampler, _sampler_ = DistributedSampler(self._data), DistributedSampler(self._data, shuffle=False)
         else:
             _sampler, _sampler_ = None, None
 
         if self.data_ is not None:
-            sampler_ = DistributedSampler(self.data_, shuffle=False) if self.DDP else None
+            sampler_ = DistributedSampler(self.data_, shuffle=False) if (self.DDP and self.use_distributed_sampler) else None
         else:
             sampler_ = None
 
@@ -549,10 +725,17 @@ class Trainer:
         # Batch size
         ###
 
-        # Calculate per-rank batch sizes
-        _batch_size  = self._batch_size // self.WORLD_SIZE
-        _batch_size_ = self._batch_size_ // self.WORLD_SIZE
-        batch_size_  = self.batch_size_ // self.WORLD_SIZE
+        # Calculate per-rank batch sizes.
+        # By default Trainer expects global batch sizes and divides by WORLD_SIZE.
+        # Some pipelines (e.g., custom DALI loaders) provide per-rank sizes directly.
+        if self.batch_size_is_per_rank:
+            _batch_size  = self._batch_size
+            _batch_size_ = self._batch_size_
+            batch_size_  = self.batch_size_
+        else:
+            _batch_size  = self._batch_size // self.WORLD_SIZE
+            _batch_size_ = self._batch_size_ // self.WORLD_SIZE
+            batch_size_  = self.batch_size_ // self.WORLD_SIZE
 
         # Ensure minimum batch sizes for stability
         _batch_size = max(1, _batch_size)
@@ -569,11 +752,41 @@ class Trainer:
             pin_memory=self.is_cuda,
             persistent_workers=(self.num_workers > 0),
         )
+        if self.num_workers > 0 and self.is_cuda:
+            import multiprocessing as mp
 
-        train_sampler = _sampler if _sampler is not None else RandomSampler(self._data)
-        batch_sampler = BatchSampler(train_sampler, _batch_size, drop_last=self.drop_last_batch)
+            common_args["multiprocessing_context"] = mp.get_context("spawn")
+
+        batch_sampler = None
+        if not self.DDP and hasattr(self._data, "make_batch_sampler"):
+            batch_sampler = self._data.make_batch_sampler(
+                batch_size=_batch_size,
+                drop_last=self.drop_last_batch,
+                seed=self.epoch,
+            )
+        if batch_sampler is None:
+            if _sampler is not None:
+                train_sampler = _sampler
+            elif self.DDP and not self.use_distributed_sampler:
+                train_sampler = SequentialSampler(self._data)
+            else:
+                train_sampler = RandomSampler(self._data)
+            batch_sampler = BatchSampler(train_sampler, _batch_size, drop_last=self.drop_last_batch)
         if self.repeat_train_batch > 1:
             batch_sampler = RepeatBatchSampler(batch_sampler, self.repeat_train_batch)
+
+        self._batches_per_train_epoch = len(batch_sampler)
+        self._use_continuous_train_batches = self._resolve_continuous_train_batches(self._batches_per_train_epoch)
+        if self._use_continuous_train_batches:
+            if self.train_based_on_epochs:
+                raise ValueError("continuous_train_batches requires step-based training (epochs=0, steps>0).")
+            epoch_sampler = self._get_epoch_sampler(batch_sampler)
+            batch_sampler = StepBudgetBatchSampler(
+                batch_sampler,
+                total_batches=self.steps,
+                sampler_for_epoch=epoch_sampler,
+                get_epoch=lambda: self.epoch,
+            )
 
         self._loader = DL(
             self._data,
@@ -582,13 +795,145 @@ class Trainer:
             **common_args,
         )
 
-        _args_ = dict(shuffle=False, sampler=_sampler_, batch_size=_batch_size_, collate_fn=self.collate_fn_, **common_args)
-        args_  = dict(shuffle=False, sampler=sampler_ , batch_size=batch_size_ , collate_fn=self.collate_fn_, **common_args)
+        self._loader_ = self._make_eval_dataloader(
+            DL,
+            self._data,
+            batch_size=_batch_size_,
+            collate_fn=self.collate_fn_,
+            distributed_sampler=_sampler_,
+            common_args=common_args,
+        )
+        self.loader_ = (
+            self._make_eval_dataloader(
+                DL,
+                self.data_,
+                batch_size=batch_size_,
+                collate_fn=self.collate_fn_,
+                distributed_sampler=sampler_,
+                common_args=common_args,
+            )
+            if self.data_ is not None
+            else None
+        )
 
-        self._loader_ = DL(self._data, **_args_)
-        self.loader_  = DL(self.data_, **args_) if self.data_ is not None else None
+        self._timing_mark("trainer_dataloader")
 
         return
+
+    def _make_eval_dataloader(
+        self,
+        loader_cls,
+        dataset,
+        *,
+        batch_size: int,
+        collate_fn,
+        distributed_sampler,
+        common_args: dict,
+    ):
+        if dataset is None:
+            return None
+        batch_sampler = None
+        if not self.DDP:
+            resolve = getattr(dataset, "make_batch_sampler", None)
+            if resolve is not None:
+                batch_sampler = resolve(batch_size=batch_size, drop_last=False, seed=0)
+        if batch_sampler is not None:
+            return loader_cls(
+                dataset,
+                batch_sampler=batch_sampler,
+                collate_fn=collate_fn,
+                **common_args,
+            )
+        return loader_cls(
+            dataset,
+            shuffle=False,
+            sampler=distributed_sampler,
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+            **common_args,
+        )
+
+    def _get_epoch_sampler(self, batch_sampler):
+        if isinstance(batch_sampler, RepeatBatchSampler):
+            batch_sampler = batch_sampler.batch_sampler
+        return getattr(batch_sampler, "sampler", None)
+
+    def _resolve_continuous_train_batches(self, batches_per_epoch: int) -> bool:
+        if self.continuous_train_batches is True:
+            return True
+        if self.continuous_train_batches is False:
+            return False
+        return (not self.train_based_on_epochs) and int(batches_per_epoch) == 1
+
+    def _maybe_advance_continuous_epoch(self) -> bool:
+        if not self._use_continuous_train_batches:
+            return True
+        self._batches_in_train_epoch += 1
+        if self._batches_in_train_epoch < self._batches_per_train_epoch:
+            return True
+        self._batches_in_train_epoch = 0
+        return self._advance_train_epoch()
+
+    def _set_sampler_epoch(self, epoch: int) -> None:
+        loader = getattr(self, "_loader", None)
+        if loader is None:
+            return
+
+        sampler = getattr(loader, "sampler", None)
+        if sampler is not None and hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
+            return
+
+        batch_sampler = getattr(loader, "batch_sampler", None)
+        if isinstance(batch_sampler, RepeatBatchSampler):
+            batch_sampler = batch_sampler.batch_sampler
+        inner_sampler = getattr(batch_sampler, "sampler", None) if batch_sampler is not None else None
+        if inner_sampler is not None and hasattr(inner_sampler, "set_epoch"):
+            inner_sampler.set_epoch(epoch)
+
+    def _advance_train_epoch(self) -> bool:
+        """Advance epoch bookkeeping after the train loader is exhausted."""
+        self.time_per_epoch.append(time.time() - self._train_epoch_start_time)
+        self._train_epoch_start_time = time.time()
+
+        if self.train_based_on_epochs:
+            if (self.epoch % self.stats_every) == 0:
+                self.statistics()
+
+        self.trigger_callbacks("epoch_end")
+
+        if self.update_schedule_every_epoch:
+            if self.reduce_lr_on_plateau:
+                metric = self.test_loss_fullbatch[-1] if self.test_loss_fullbatch else self.train_loss_per_batch[-1]
+                self.schedule.step(metric)
+            else:
+                self.schedule.step()
+
+        self.epoch += 1
+
+        if self.train_based_on_epochs and self.epoch > self.epochs:
+            return False
+
+        self.trigger_callbacks("epoch_start")
+        self._set_sampler_epoch(self.epoch)
+        return True
+
+    def _fetch_train_batch(self, loader_iter):
+        data_fetch_start = time.time()
+        try:
+            batch = next(loader_iter)
+            data_fetch_end = time.time()
+            return batch, loader_iter, data_fetch_end - data_fetch_start, False
+        except StopIteration:
+            if not self._advance_train_epoch():
+                data_fetch_end = time.time()
+                return None, loader_iter, data_fetch_end - data_fetch_start, True
+
+            loader_iter = iter(self._loader)
+            data_fetch_start = time.time()
+            batch = next(loader_iter)
+            data_fetch_end = time.time()
+            return batch, loader_iter, data_fetch_end - data_fetch_start, False
 
     #------------------------#
     # TRAINING
@@ -596,93 +941,89 @@ class Trainer:
 
     def train(self):
 
+        from mlutils.train_batch_stream import OverlappedTrainBatchStream
+
+        self._timing_mark("trainer_train_enter")
+
         self.is_training = True
         self.make_dataloader()
 
-        self.trigger_callbacks("epoch_start")
-        self.trigger_callbacks("batch_start")
-        self.statistics()
-        self.trigger_callbacks("batch_end")
-        self.trigger_callbacks("epoch_end")
+        self._run_train_start()
 
         # increment epoch and start training
         self.epoch += 1
-        loader_iter = iter(self._loader)
-        if self.DDP and hasattr(self._loader, 'sampler') and hasattr(self._loader.sampler, 'set_epoch'):
-            self._loader.sampler.set_epoch(self.epoch)
+        self._set_sampler_epoch(self.epoch)
 
         # make batch iterator
         self.make_batch_iterator()
 
-        epoch_start_time = time.time()
+        self._train_epoch_start_time = time.time()
+        self._batches_in_train_epoch = 0
+        batch_stream = OverlappedTrainBatchStream(self) if self.overlap_train_dataloader else None
+        loader_iter = None if (batch_stream is not None or self._use_continuous_train_batches) else iter(self._loader)
 
-        while self.step < self.steps:
-            self.step += 1
+        if batch_stream is not None:
+            batch, dataload_wait = batch_stream.initial_batch()
+        elif self._use_continuous_train_batches:
+            loader_iter = iter(self._loader)
+            data_fetch_start = time.time()
+            batch = next(loader_iter)
+            dataload_wait = time.time() - data_fetch_start
+        else:
+            batch, loader_iter, dataload_wait, should_stop = self._fetch_train_batch(loader_iter)
+            if should_stop:
+                self.is_training = False
+                return
 
-            # load next batch
-            # measure data loading time (time to fetch the next batch)
-            try:
-                data_fetch_start = time.time()
-                batch = next(loader_iter)
-                data_fetch_end = time.time()
-            except StopIteration:
-                # increment epoch and loop back through the dataset
+        self._timing_mark("trainer_first_batch_ready")
 
-                # update time_per_epoch
-                self.time_per_epoch.append(time.time() - epoch_start_time)
-                epoch_start_time = time.time()
+        try:
+            while self.step < self.steps:
+                self.step += 1
+                self.time_dataload_per_step.append(dataload_wait)
 
-                # calculate statistics if training based on epochs
-                if self.train_based_on_epochs:
-                    if (self.epoch % self.stats_every) == 0:
+                self.trigger_callbacks("batch_start")
+
+                if batch_stream is not None and self.step < self.steps:
+                    batch_stream.prefetch()
+
+                loss = self.train_step(batch)
+                self.update_batch_iterator(loss.item())
+
+                if self.log_rank_every_steps > 0 and (self.step % self.log_rank_every_steps) == 0:
+                    print(
+                        f"[Rank {self.GLOBAL_RANK}] step={self.step} epoch={self.epoch} "
+                        f"loss={loss.item():.6f}"
+                    )
+
+                if not self.train_based_on_epochs:
+                    if (self.step % self.stats_every) == 0:
                         self.statistics()
 
-                # trigger epoch end callback
-                self.trigger_callbacks("epoch_end")
+                self.trigger_callbacks("batch_end")
 
-                # update schedule
-                if self.update_schedule_every_epoch:
-                    self.schedule.step()
+                if self.step >= self.steps:
+                    break
 
-                # increment epoch
-                self.epoch += 1
+                if not self._maybe_advance_continuous_epoch():
+                    break
 
-                # commence next epoch
-                if self.train_based_on_epochs:
-                    if self.epoch > self.epochs:
+                if batch_stream is not None:
+                    batch, dataload_wait = batch_stream.get_prefetched()
+                    if batch is None:
                         break
+                elif self._use_continuous_train_batches:
+                    data_fetch_start = time.time()
+                    batch = next(loader_iter)
+                    dataload_wait = time.time() - data_fetch_start
+                else:
+                    batch, loader_iter, dataload_wait, should_stop = self._fetch_train_batch(loader_iter)
+                    if should_stop:
+                        break
+        finally:
+            if batch_stream is not None:
+                batch_stream.close()
 
-                # trigger epoch start callback
-                self.trigger_callbacks("epoch_start")
-
-                loader_iter = iter(self._loader)
-                if self.DDP and hasattr(self._loader, 'sampler') and hasattr(self._loader.sampler, 'set_epoch'):
-                    self._loader.sampler.set_epoch(self.epoch)
-
-                data_fetch_start = time.time()
-                batch = next(loader_iter)
-                data_fetch_end = time.time()
-
-            self.time_dataload_per_step.append(data_fetch_end - data_fetch_start)
-
-            # trigger batch start callback
-            self.trigger_callbacks("batch_start")
-
-            # training step
-            loss = self.train_step(batch)
-
-            # print batch iterator
-            self.update_batch_iterator(loss.item())
-
-            # calculate statistics if training based on steps
-            if not self.train_based_on_epochs:
-                if (self.step % self.stats_every) == 0:
-                    self.statistics()
-
-            # trigger batch end callback
-            self.trigger_callbacks("batch_end")
-
-        # calculate final statistics
         self.statistics()
         self.trigger_callbacks("epoch_end")
 
@@ -691,6 +1032,10 @@ class Trainer:
         return
 
     def train_step(self, batch):
+
+        if not self._first_train_step_marked:
+            self._timing_mark("trainer_first_train_step")
+            self._first_train_step_marked = True
 
         # reset peak memory stats (less frequently to reduce overhead)
         if self.is_cuda:
@@ -701,12 +1046,14 @@ class Trainer:
 
         self.model.train()
 
+        batch = self.prepare_batch(batch, split='train')
+
         # forward/model eval timing (loss only)
         model_eval_start = time.time()
 
         # calculate loss
         with self.auto_cast:
-            loss = self.batch_loss(batch, split='train')
+            loss = self.batch_loss(batch, split='train', prepared=True)
 
         # measure model eval time
         model_eval_end = time.time()
@@ -721,11 +1068,12 @@ class Trainer:
         # trigger post grad callback
         self.trigger_callbacks("batch_post_grad")
 
-        # unscale gradients
-        self.grad_scaler.unscale_(self.opt)
-
-        # clip gradients
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm).item()
+        should_step = (self.step % self.grad_accumulation_steps) == 0
+        grad_norm = float('nan')
+        if should_step:
+            # GradScaler only allows `unscale_` once per optimizer update.
+            self.grad_scaler.unscale_(self.opt)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm).item()
 
         # append grad norm and learning rate to list
         self.grad_norm_per_step.append(grad_norm)
@@ -738,7 +1086,7 @@ class Trainer:
         #     # maybe trigger early stop or dump checkpoint
         #     # raise ValueError("Exploding grad norm")
 
-        if (self.step % self.grad_accumulation_steps) == 0:
+        if should_step:
             # step optimizer with gradient scaling
             self.grad_scaler.step(self.opt) # replace self.opt.step()
 
@@ -760,7 +1108,7 @@ class Trainer:
 
         # update memory utilization per step (less frequently to reduce overhead)
         if self.is_cuda:
-            self.memory_utilization.append(torch.cuda.max_memory_allocated() / 1024**3)
+            self.record_cuda_memory()
 
         return loss
 
@@ -771,7 +1119,7 @@ class Trainer:
             else:
                 bar_format = '{desc} {bar}[{rate_fmt}]'
             self.batch_iterator = tqdm(
-                total=self.steps, bar_format=bar_format, ncols=80, initial=self.step,
+                total=self.steps, bar_format=bar_format, ncols=90, initial=self.step,
             )
         else:
             self.batch_iterator = None
@@ -784,10 +1132,12 @@ class Trainer:
                 iter_msg = f"[Epoch {self.epoch} / {self.epochs}] "
             else:
                 iter_msg = f"[Step {self.step} / {self.steps}] "
+            grad_norm = self.grad_norm_per_step[-1] if self.grad_norm_per_step else float('nan')
             self.batch_iterator.set_description(
                 iter_msg +
                 f"LR {self.schedule.get_last_lr()[0]:.2e} " +
-                f"LOSS {loss:.8e}"
+                f"LOSS {loss:.4e} " +
+                f"GNORM: {grad_norm:.2e}"
             )
             self.batch_iterator.update(1)
 
@@ -801,10 +1151,41 @@ class Trainer:
             return batch.to(self.device, **kw)
         elif batch is None:
             return None
+        elif self.gnn_loader and (self.graph_loader_backend == "dgl") and hasattr(batch, "ndata"):
+            # Prefer moving DGL graphs to trainer device; if unavailable (e.g., CPU-only DGL),
+            # fall back to host graph handling.
+            if hasattr(batch, "to"):
+                try:
+                    return batch.to(self.device)
+                except Exception:
+                    return batch
+            return batch
+        elif hasattr(batch, 'to'):
+            # Support Graph/Data objects (e.g. PyG) that provide their own .to()
+            return batch.to(self.device)
         else:
             return batch
 
-    def batch_loss(self, batch, split: str):
+    def _graph_targets(self, batch):
+        if hasattr(batch, "y"):
+            return batch.y
+        if hasattr(batch, "ndata") and ("y" in batch.ndata):
+            return batch.ndata["y"]
+        raise ValueError("Graph batch does not contain target field 'y'.")
+
+    def _graph_num_graphs(self, batch) -> int:
+        if isinstance(batch, dict) and "num_graphs" in batch:
+            return int(batch["num_graphs"])
+        if hasattr(batch, "num_graphs"):
+            return int(batch.num_graphs)
+        if hasattr(batch, "batch_size"):
+            return int(batch.batch_size)
+        if hasattr(batch, "batch_num_nodes"):
+            counts = batch.batch_num_nodes()
+            return int(len(counts))
+        return 1
+
+    def prepare_batch(self, batch, split: str):
 
         # move to device
         batch = self.move_to_device(batch)
@@ -812,13 +1193,22 @@ class Trainer:
         # apply preprocessor
         batch = self.apply_preprocessor(batch, split=split)
 
+        return batch
+
+    def batch_loss(self, batch, split: str, prepared: bool = False):
+
+        if not prepared:
+            batch = self.prepare_batch(batch, split=split)
+
         # calculate loss
         if self.batch_lossfun is not None:
             loss = self.batch_lossfun(self, self.model, batch)
         elif self.gnn_loader:
-            batch = batch.to(self.device)
             yh = self.model(batch)
-            loss = self.lossfun(yh, batch.y)
+            y = self._graph_targets(batch)
+            if torch.is_tensor(y) and (y.device != yh.device):
+                y = y.to(yh.device)
+            loss = self.lossfun(yh, y)
         else:
             # assume batch is a tuple of (x, y)
             x, y = batch
@@ -826,6 +1216,51 @@ class Trainer:
             loss = self.lossfun(yh, y)
 
         return loss
+
+    def record_cuda_memory(self) -> None:
+        if not self.is_cuda:
+            return
+
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+        max_reserved = torch.cuda.max_memory_reserved() / 1024**3
+
+        self.memory_allocated.append(allocated)
+        self.memory_reserved.append(reserved)
+        self.max_memory_allocated.append(max_allocated)
+        self.max_memory_reserved.append(max_reserved)
+        # Legacy mirror for older checkpoints / callbacks (same as max_memory_allocated per step).
+        self.memory_utilization.append(max_allocated)
+
+    def _stats_model_context(self):
+        trainer = self
+
+        class _Context:
+            def __enter__(self):
+                self.model = trainer.model
+                use_eager_stats = (
+                    not trainer.compile_stats_model
+                    and trainer._uses_compiled_model
+                    and getattr(trainer, "_eager_model", None) is not None
+                    and trainer.model is not trainer._eager_model
+                )
+                if use_eager_stats:
+                    trainer.model = _DDPStatsModelProxy(trainer._eager_model) if trainer.DDP else trainer._eager_model
+                return trainer.model
+
+            def __exit__(self, exc_type, exc, tb):
+                trainer.model = self.model
+                return False
+
+        return _Context()
+
+    def cleanup_after_statistics(self):
+        if not self.is_cuda:
+            return
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
 
     def apply_preprocessor(self, batch, split: str):
         if self._preprocess_fn is not None and split == 'train':
@@ -841,7 +1276,7 @@ class Trainer:
     def get_batch_size(self, batch, loader):
         try:
             if self.gnn_loader:
-                bs = batch.num_graphs
+                bs = self._graph_num_graphs(batch)
             elif isinstance(batch, tuple) or isinstance(batch, list):
                 bs = len(batch[0])
             elif isinstance(batch, dict):
@@ -854,11 +1289,12 @@ class Trainer:
 
     @torch.no_grad()
     def call_statsfun(self, loader, split: str):
-        self.model.eval()
-        if self.statsfun is not None:
-            return self.statsfun(self, loader, split=split)
-        else:
-            return self.fallback_statsfun(loader, split=split)
+        with self._stats_model_context():
+            self.model.eval()
+            if self.statsfun is not None:
+                return self.statsfun(self, loader, split=split)
+            else:
+                return self.fallback_statsfun(loader, split=split)
 
     def fallback_statsfun(self, loader, split: str):
 
@@ -888,63 +1324,74 @@ class Trainer:
             L, N = L_tensor.item(), N_tensor.item()
 
         if N == 0:
-            loss = float('nan')
+            loss = unset_metric()
         else:
-            loss = L / N
+            loss = normalize_metric(L / N)
 
         return loss, dict()
     
     def statistics(self):
 
+        mark_statistics_timing = self.run_timer is not None and not self._statistics_timing_marked
+        if mark_statistics_timing:
+            self._timing_mark("trainer_statistics_start")
+
         # train stats
         train_stats_time_start = time.time()
-        _loss, _stats = self.call_statsfun(self._loader_, split='train') if self._fullbatch_stats else (float('nan'), dict())
+        _loss, _stats = self._eval_fullbatch(self._loader_, enabled=self._fullbatch_stats, split='train')
         self.train_stats_time.append(time.time() - train_stats_time_start)
 
         # test stats
         test_stats_time_start = time.time()
-        loss_, stats_ = self.call_statsfun(self.loader_, split='val') if (self.fullbatch_stats_ and self.loader_ is not None) else (float('nan'), dict())
+        loss_, stats_ = self._eval_fullbatch(self.loader_, enabled=self.fullbatch_stats_, split='val')
         self.test_stats_time.append(time.time() - test_stats_time_start)
+
+        _loss_ema = unset_metric()
+        _stats_ema: dict = {}
+        loss_ema_ = unset_metric()
+        stats_ema_: dict = {}
 
         if self.use_ema:
             assert self.ema is not None, "EMA is not initialized"
-            # save model state
             state_dict_bkp = copy_model_state(self.model)
-            # load ema weights
             self.ema.load_ema_weights(self.model)
-            # calculate stats
-            _loss_ema, _stats_ema = self.call_statsfun(self._loader_, split='train') if self._fullbatch_stats else (float('nan'), dict())
-            loss_ema_, stats_ema_ = self.call_statsfun(self.loader_, split='val') if (self.fullbatch_stats_ and self.loader_ is not None) else (float('nan'), dict())
-            # restore model state
+            _loss_ema, _stats_ema = self._eval_fullbatch(self._loader_, enabled=self._fullbatch_stats, split='train')
+            loss_ema_, stats_ema_ = self._eval_fullbatch(self.loader_, enabled=self.fullbatch_stats_, split='val')
             load_model_state(self.model, state_dict_bkp)
+
+        self.cleanup_after_statistics()
+
+        if mark_statistics_timing:
+            self._timing_mark("trainer_statistics_done")
+            self._statistics_timing_marked = True
 
         # printing
         if self.verbose and (self.GLOBAL_RANK == 0):
+            msg = f"\n"
             if self.train_based_on_epochs:
-                msg = f"[Epoch {self.epoch} / {self.epochs}] "
+                msg += f"[Epoch {self.epoch} / {self.epochs}] "
             else:
-                msg = f"[Step {self.step} / {self.steps}] "
+                msg += f"[Step {self.step} / {self.steps}] "
 
-            msg += f"TRAIN LOSS: {_loss:.6e} | TEST LOSS: {loss_:.6e}"
+            msg += f"TRAIN LOSS: {format_metric(_loss)} | TEST LOSS: {format_metric(loss_)}"
 
             if self.use_ema:
-                msg += f" | TRAIN LOSS (EMA): {_loss_ema:.6e} | TEST LOSS (EMA): {loss_ema_:.6e}"
+                msg += f" | TRAIN LOSS (EMA): {format_metric(_loss_ema)} | TEST LOSS (EMA): {format_metric(loss_ema_)}"
 
             msg += f"\nTRAIN STATS TIME: {self.train_stats_time[-1]:.4e}s | TEST STATS TIME: {self.test_stats_time[-1]:.4e}s"
             print(msg)
 
-        if self.is_training:
-            self.train_loss_fullbatch.append(_loss)
-            self.test_loss_fullbatch.append(loss_)
-            self.num_steps_fullbatch.append(len(self.train_loss_per_batch))
-            self.train_stats_fullbatch.append(_stats)
-            self.test_stats_fullbatch.append(stats_)
+        self.train_loss_fullbatch.append(_loss)
+        self.test_loss_fullbatch.append(loss_)
+        self.num_steps_fullbatch.append(len(self.train_loss_per_batch))
+        self.train_stats_fullbatch.append(_stats)
+        self.test_stats_fullbatch.append(stats_)
 
-            if self.use_ema:
-                self.train_loss_fullbatch_ema.append(_loss_ema)
-                self.test_loss_fullbatch_ema.append(loss_ema_)
-                self.train_stats_fullbatch_ema.append(_stats_ema)
-                self.test_stats_fullbatch_ema.append(stats_ema_)
+        if self.use_ema:
+            self.train_loss_fullbatch_ema.append(_loss_ema)
+            self.test_loss_fullbatch_ema.append(loss_ema_)
+            self.train_stats_fullbatch_ema.append(_stats_ema)
+            self.test_stats_fullbatch_ema.append(stats_ema_)
 
         return
 #======================================================================#

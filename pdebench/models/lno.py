@@ -2,9 +2,23 @@
 import math
 import torch
 
+from dataclasses import dataclass
+from typing import Optional
+
 __all__ = [
     "LNO",
 ]
+
+@dataclass
+class LNOConfig:
+    model: str = "lno"
+    num_blocks: int = 8
+    channel_dim: int = 64
+    num_heads: int = 8
+    num_modes: int = 256
+    num_layers_kv_proj: int = 3
+    act: Optional[str] = None
+
 
 # "model": {
 #     "name": "LNO",
@@ -101,22 +115,44 @@ class AttentionBlock(torch.nn.Module):
 #======================================================================#
     
 class LNO(torch.nn.Module):
-    def __init__(self, n_block, n_mode, n_dim, n_head, n_layer, x_dim, y1_dim, y2_dim, act, model_attr):
+    def __init__(self, config: LNOConfig, metadata=None):
         super().__init__()
+        metadata = {} if metadata is None else metadata
+        dataset = metadata.get("dataset")
+        n_block = config.num_blocks
+        n_mode = config.num_modes
+        n_dim = config.channel_dim
+        n_head = config.num_heads
+        n_layer = config.num_layers_kv_proj
+        c_in = metadata["c_in"]
+        c_out = metadata["c_out"]
+        x_dim = c_in
+        y1_dim = c_in
+        y2_dim = c_out
+        act = config.act or "GELU"
+        model_attr = {"time": False if dataset in {"navier_stokes", "plasticity"} else metadata.get("time_cond")}
+
+        if dataset in {"navier_stokes", "plasticity"}:
+            x_dim = int(metadata["space_dim"])
+            y1_dim = int(metadata.get("fun_dim", c_in - int(metadata["space_dim"])))
+            if dataset == "plasticity":
+                x_dim = int(metadata["space_dim"]) + 1
+        if dataset == "plasticity":
+            if model_attr["time"]:
+                y2_dim = 1
+            y1_dim = int(metadata.get("fun_dim", y1_dim))
+
         self.n_block = n_block
         self.n_mode = n_mode
         self.n_dim = n_dim
         self.n_head = n_head
         self.n_layer = n_layer
         self.act = ACTIVATION[act]
-        
+
         self.x_dim = x_dim
         self.y1_dim = y1_dim
-        if model_attr["time"]:
-            self.y2_dim = 1
-        else:
-            self.y2_dim = y2_dim
-        
+        self.y2_dim = 1 if model_attr["time"] else y2_dim
+
         self.trunk_projector = MLP(self.x_dim, self.n_dim, self.n_dim, self.n_layer, self.act)
         self.branch_projector = MLP(self.y1_dim, self.n_dim, self.n_dim, self.n_layer, self.act)
         self.out_mlp = MLP(self.n_dim, self.n_dim, self.y2_dim, self.n_layer, self.act)

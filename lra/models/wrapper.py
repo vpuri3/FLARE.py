@@ -1,14 +1,13 @@
 #
 import torch
 from torch import nn
-import torch.nn.functional as F
+
+from .backends import MODEL_TYPES
+from .embeddings import PosEmb, RotaryPositionalEmbeddings, TokenEmb
 
 __all__ = [
     'ModelWrapper',
 ]
-
-from .backends import MODEL_TYPES
-from .embeddings import TokenEmb, PosEmb, RotaryPositionalEmbeddings
 
 #======================================================================#
 class ModelWrapper(nn.Module):
@@ -39,6 +38,7 @@ class ModelWrapper(nn.Module):
         self.vocab_size = vocab_size
         self.pad_id = pad_id
         self.pos_embed_type = pos_embed
+        self.add_pos_each_block = backend != 'transolver'
 
         #--------------------------------#
         # Pooling strategy
@@ -133,6 +133,10 @@ class ModelWrapper(nn.Module):
         # Weight initialization
         #--------------------------------#
         self.init_weights()
+        for block in self.blocks:
+            initialize_weights = getattr(block, 'initialize_weights', None)
+            if initialize_weights is not None:
+                initialize_weights()
 
     def init_weights(self):
         def _init(module: nn.Module):
@@ -159,8 +163,12 @@ class ModelWrapper(nn.Module):
         # Reshape input_ids for retrieval
         #--------------------------------#
         if self.task == 'retrieval':
-            assert N == 2 * self.max_length, f"Sequence length must be 2 * max_length for retrieval. Got {N} and {self.max_length}."
+            assert N == 2 * self.max_length, (
+                f"Sequence length must be 2 * max_length for retrieval. Got {N} and {self.max_length}."
+            )
             input_ids = input_ids.reshape(2 * B, self.max_length)
+            if attention_mask is not None:
+                attention_mask = attention_mask.reshape(2 * B, self.max_length)
             B, N = input_ids.shape  # Update B and N after reshape
 
         #--------------------------------#
@@ -185,7 +193,7 @@ class ModelWrapper(nn.Module):
         #--------------------------------#
         # Get positional embeddings for abs/sin (rope handled separately in blocks)
         #--------------------------------#
-        if self.pos_emb is not None: 
+        if self.pos_emb is not None:
             pos = self.pos_emb(B, N, device)
             pos = pos.unsqueeze(0).expand(B, -1, -1) if pos.dim() == 2 else pos # [B, N, C]
         else:
@@ -194,8 +202,11 @@ class ModelWrapper(nn.Module):
         #--------------------------------#
         # Process blocks
         #--------------------------------#
+        if pos is not None and not self.add_pos_each_block:
+            x = x + pos
         for block in self.blocks:
-            x = (x + pos) if pos is not None else x
+            if pos is not None and self.add_pos_each_block:
+                x = x + pos
             x = block(x, attention_mask=attention_mask)
 
         #--------------------------------#
@@ -207,9 +218,18 @@ class ModelWrapper(nn.Module):
         # Pooling
         #--------------------------------#
         if self.pool == 'mean':
-            x = x.mean(dim=1)
+            if attention_mask is None:
+                x = x.mean(dim=1)
+            else:
+                pool_mask = attention_mask.unsqueeze(-1).to(dtype=x.dtype)
+                x = (x * pool_mask).sum(dim=1) / pool_mask.sum(dim=1).clamp_min(1.0)
         elif self.pool == 'max':
-            x = x.max(dim=1).values
+            if attention_mask is None:
+                x = x.max(dim=1).values
+            else:
+                pool_mask = attention_mask.unsqueeze(-1)
+                x = x.masked_fill(~pool_mask, torch.finfo(x.dtype).min).max(dim=1).values
+                x = torch.where(attention_mask.any(dim=1, keepdim=True), x, torch.zeros_like(x))
         elif self.pool == 'cls':
             x = x[:, 0]  # Take CLS token (first token)
 

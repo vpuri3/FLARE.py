@@ -1,15 +1,66 @@
 #
-import torch
-
 import os
+import socket
+import sys
+import time
+
+import torch
 import yaml
-from jsonargparse import CLI
-from typing import Union, List
-from dataclasses import dataclass
+from jsonargparse import ArgumentParser
+
+import mlutils
 
 # local
 import pdebench
-import mlutils
+from pdebench.callbacks import (
+    make_ahmedml_surface_statsfun,
+    make_drivaerml_surface_statsfun,
+    make_navier_stokes_statsfun,
+    make_plasticity_statsfun,
+    surface_batch_loss,
+)
+from pdebench.config import Config
+from pdebench.dataset.ginot import (
+    ginot_model_forward,
+    ginot_postprocess_displacement,
+    make_ginot_statsfun,
+)
+from pdebench.dataset.loss import compute_packed_loss
+from pdebench.dataset.lpbf import (
+    LPBF_DATASETS,
+    lpbf_flare_batch_loss,
+    lpbf_warped_rel_l2,
+    make_lpbf_collate_fn,
+    make_lpbf_statsfun,
+    resolve_lpbf_batch_format,
+)
+from pdebench.dataset.mesh_runtime import (
+    MESH_GRAPH_MODELS,
+    MESH_SEQUENCE_MODELS,
+    make_mesh_static_statsfun,
+    mesh_batch_plaid_scaled_mse,
+    mesh_model_forward,
+    mesh_sequence_collate_fn,
+    mesh_static_supports_time_cond,
+)
+from pdebench.dataset.plaid_datasets import PLAID_DATASETS
+from pdebench.dataset.registry import resolve_dataset_name
+from pdebench.dataset.sample import FeatureRequest, LossSpec
+from pdebench.dataset.utils import (
+    compile_stats_model_for_dataset,
+    resolve_use_flash_varlen,
+    uses_ginot_pipeline,
+)
+from pdebench.distributed import (
+    build_context_parallel_state,
+    cp_reduced_mse_loss,
+    cp_reduced_rel_l2_loss,
+    shard_batch,
+)
+from pdebench.models.model_factory import EDGE_INFO_MODELS, make_model
+
+STATIC_MESH_DATASETS = PLAID_DATASETS
+MSE_NORMALIZED_DATASETS = frozenset({"nasa_crm", "ahmedml_surface", "drivaerml_surface"})
 
 #======================================================================#
 PROJDIR = mlutils.dotdot(os.path.dirname(__file__))
@@ -19,7 +70,6 @@ CASEDIR = os.path.join(PROJDIR, 'out', OUTNAME)
 mlutils.set_cache_path(mlutils.dotdot(PROJDIR))
 os.makedirs(CASEDIR, exist_ok=True)
 
-import socket
 MACHINE = socket.gethostname()
 if MACHINE == "eagle":
     # VDEL Eagle - 1 node: 4x 2080Ti 11 GB
@@ -27,782 +77,209 @@ if MACHINE == "eagle":
 else:
     DATADIR_BASE = os.path.join(PROJDIR, 'data')
 
-#======================================================================#
-def make_model(cfg, metadata, GLOBAL_RANK):
-    """
-    Create and configure model based on cfg.model_type.
 
-    Args:
-        cfg: Configuration object
-        metadata: Dataset metadata from pdebench.load_dataset
-        GLOBAL_RANK: Global rank for distributed training
+def main(cfg, device, *, run_timer: mlutils.RunTimer | None = None):
+    timer = run_timer or mlutils.disabled_timer()
+    timer.mark("main_enter")
 
-    Returns:
-        tuple: (updated cfg, model instance)
-    """
-
-    c_in = metadata['c_in']
-    c_out = metadata['c_out']
-
-    if cfg.model_type == 'transolver':
-        #--------------------------------#
-        # Transolver: https://arxiv.org/abs/2402.02366
-        #--------------------------------#
-        if cfg.use_defaults:
-            cfg.epochs = 250 if cfg.dataset in ['shapenet_car', 'lpbf'] else 500
-            if cfg.dataset in ['elasticity', 'shapenet_car', 'lpbf'] or cfg.dataset.startswith('drivaerml'):
-                cfg.batch_size = 1
-            elif cfg.dataset in ['airfoil_steady', 'pipe', 'darcy', 'airfoil_dynamic', 'cylinder_flow']:
-                cfg.batch_size = 4
-            else:
-                raise ValueError(f"Batch size not set for dataset {cfg.dataset}")
-            cfg.learning_rate = 1e-3
-            cfg.opt_beta1 = 0.9
-            cfg.opt_beta2 = 0.999
-            cfg.schedule = 'OneCycleLR'
-            cfg.one_cycle_pct_start = 0.3
-            cfg.one_cycle_div_factor = 25
-            cfg.one_cycle_final_div_factor = 1e4
-            cfg.one_cycle_override_min_lr = None
-            cfg.clip_grad_norm = 0.1
-            if cfg.dataset in ['shapenet_car']:
-                cfg.weight_decay = 5e-2
-            elif cfg.dataset in ['drivaerml_40k']:
-                cfg.weight_decay = 1e-4
-            elif cfg.dataset in ['lpbf']:
-                cfg.weight_decay = 1e-4
-            else:
-                cfg.weight_decay = 1e-5
-
-            # model params
-            n_layers = 8
-            n_hidden = 128 if cfg.dataset not in ['airfrans', 'shapenet_car', 'navier_stokes'] else 256
-            slice_num = 64 if cfg.dataset not in ['airfrans', 'shapenet_car', 'navier_stokes'] else 32
-            n_head = 8
-            mlp_ratio = 1.0
-
-        else:
-            n_layers = cfg.num_blocks
-            n_hidden = cfg.channel_dim
-            slice_num = cfg.num_slices
-            n_head = cfg.num_heads
-            mlp_ratio = cfg.mlp_ratio
-
-        if cfg.conv2d:
-            model_name = 'Transolver_Structured_Mesh_2D'
-            Model = pdebench.Transolver_Structured_Mesh_2D
-            model_args = dict(
-                space_dim=c_in, out_dim=c_out, fun_dim=0, n_hidden=n_hidden, n_layers=n_layers,
-                n_head=n_head, mlp_ratio=mlp_ratio, slice_num=slice_num,
-                H=metadata['H'], W=metadata['W'], unified_pos=cfg.unified_pos,
-            )
-        else:
-            model_name = 'Transolver'
-            Model = pdebench.Transolver
-            model_args = dict(
-                space_dim=c_in, out_dim=c_out, fun_dim=0,
-                n_hidden=n_hidden, n_layers=n_layers,
-                n_head=n_head, mlp_ratio=mlp_ratio, slice_num=slice_num,
-            )
-
-    elif cfg.model_type == 'transolver++':
-        #--------------------------------#
-        # Transolver++
-        #--------------------------------#
-        if cfg.use_defaults:
-            cfg.epochs = 250 if cfg.dataset in ['shapenet_car', 'lpbf'] else 500
-
-            if cfg.dataset in ['elasticity',]:
-                cfg.batch_size = 8
-            elif cfg.dataset in ['darcy', 'airfoil_steady', 'pipe']:
-                cfg.batch_size = 4
-            elif cfg.dataset.startswith('drivaerml') or cfg.dataset in ['lpbf']:
-                cfg.batch_size = 1
-            else:
-                raise ValueError(f"Batch size not set for dataset {cfg.dataset}")
-
-            cfg.learning_rate = 1e-3
-            cfg.opt_beta1 = 0.9
-            cfg.opt_beta2 = 0.999
-            cfg.schedule = 'OneCycleLR'
-            cfg.one_cycle_pct_start = 0.3
-            cfg.one_cycle_div_factor = 25
-            cfg.one_cycle_final_div_factor = 1e4
-            cfg.one_cycle_override_min_lr = None
-            cfg.clip_grad_norm = 0.1
-            if cfg.dataset in ['shapenet_car']:
-                cfg.weight_decay = 5e-2
-            elif cfg.dataset in ['drivaerml_40k']:
-                cfg.weight_decay = 1e-4
-            elif cfg.dataset in ['lpbf']:
-                cfg.weight_decay = 1e-4
-            else:
-                cfg.weight_decay = 1e-5
-            
-            # model params
-            n_layers = 8
-            n_hidden = 128
-            slice_num = 64
-            n_head = 8
-            mlp_ratio = 1.0
-        else:
-            n_layers = cfg.num_blocks
-            n_hidden = cfg.channel_dim
-            slice_num = cfg.num_slices
-            n_head = cfg.num_heads
-            mlp_ratio = cfg.mlp_ratio
-
-        model_name = 'TransolverPlusPlus'
-        Model = pdebench.TransolverPlusPlus
-        model_args = dict(
-            space_dim=c_in, out_dim=c_out, fun_dim=0, n_hidden=n_hidden, n_layers=n_layers,
-            n_head=n_head, mlp_ratio=mlp_ratio, slice_num=slice_num,
-        )
-
-    elif cfg.model_type == 'lno':
-        #--------------------------------#
-        # LNO: https://github.com/L-I-M-I-T/LatentNeuralOperator
-        #--------------------------------#
-        if cfg.use_defaults:
-            cfg.epochs = 250 if cfg.dataset in ['shapenet_car', 'lpbf'] else 500
-            if cfg.dataset in ['elasticity', 'darcy', 'airfoil_steady', 'pipe']:
-                cfg.batch_size = 4
-            elif cfg.dataset in ['shapenet_car', 'lpbf'] or cfg.dataset.startswith('drivaerml'):
-                cfg.batch_size = 1
-            else:
-                raise ValueError(f"Batch size not set for dataset {cfg.dataset}")
-            cfg.learning_rate = 1e-3
-            cfg.opt_beta1 = 0.9
-            cfg.opt_beta2 = 0.99
-            cfg.schedule = 'OneCycleLR'
-            cfg.one_cycle_pct_start = 0.2
-            cfg.one_cycle_div_factor = 1e4
-            cfg.one_cycle_final_div_factor = 1e4
-            cfg.one_cycle_override_min_lr = None
-            cfg.clip_grad_norm = 1000.0
-            if cfg.dataset in ['shapenet_car']:
-                cfg.weight_decay = 5e-2
-            elif cfg.dataset in ['drivaerml_40k']:
-                cfg.weight_decay = 1e-4
-            elif cfg.dataset in ['lpbf']:
-                cfg.weight_decay = 1e-4
-            else:
-                cfg.weight_decay = 5e-5
-
-            # model params
-            n_head = 8
-            n_mode = 256
-            n_dim = 192 if cfg.dataset in ['elasticity'] else 128
-            n_layer = 3 if cfg.dataset in ['elasticity'] else 2
-            n_block = 8 if cfg.dataset in ['pipe', 'airfoil_steady'] else 4
-            
-        else:
-            n_head = cfg.num_heads
-            n_mode = cfg.num_modes
-            n_dim = cfg.channel_dim
-            n_layer = cfg.num_layers_kv_proj
-            n_block = cfg.num_blocks
-
-        model_name = 'LNO'
-        Model = pdebench.LNO
-        model_args = dict(
-            n_block=n_block, n_mode=n_mode, n_dim=n_dim, n_head=n_head, n_layer=n_layer, act="GELU",
-            x_dim=c_in, y1_dim=c_in, y2_dim=c_out, model_attr={"time": metadata['time_cond'],}
-        )
-
-    elif cfg.model_type == 'gnot':
-        #--------------------------------#
-        # GNOT
-        #--------------------------------#
-        if cfg.use_defaults:
-            cfg.epochs = 250 if cfg.dataset in ['shapenet_car', 'lpbf'] else 500
-            if cfg.dataset in ['elasticity']:
-                cfg.batch_size = 2
-            elif cfg.dataset in ['darcy', 'airfoil_steady', 'pipe']:
-                cfg.batch_size = 4
-            elif cfg.dataset in ['shapenet_car', 'lpbf'] or cfg.dataset.startswith('drivaerml'):
-                cfg.batch_size = 1
-            else:
-                raise ValueError(f"Batch size not set for dataset {cfg.dataset}")
-            cfg.learning_rate = 1e-3
-            cfg.opt_beta1 = 0.9
-            cfg.opt_beta2 = 0.999
-            cfg.schedule = 'OneCycleLR'
-            cfg.one_cycle_pct_start = 0.3
-            cfg.one_cycle_div_factor = 25
-            cfg.one_cycle_final_div_factor = 1e4
-            cfg.one_cycle_override_min_lr = None
-            cfg.clip_grad_norm = 0.1
-            if cfg.dataset in ['shapenet_car']:
-                cfg.weight_decay = 5e-2
-            elif cfg.dataset in ['drivaerml_40k']:
-                cfg.weight_decay = 1e-4
-            elif cfg.dataset in ['lpbf']:
-                cfg.weight_decay = 1e-4
-            elif cfg.dataset in ['darcy']:
-                cfg.weight_decay = 5e-5
-            else:
-                cfg.weight_decay = 1e-5
-
-            # model params
-            n_layers = 8
-            n_hidden = 128
-            mlp_ratio = 2.0
-            n_experts = 3
-            n_head = 8
-        else:
-            n_layers = cfg.num_blocks
-            n_hidden = cfg.channel_dim
-            mlp_ratio = cfg.mlp_ratio
-            n_experts = cfg.num_experts
-            n_head = cfg.num_heads
-
-        if cfg.dataset in ['darcy', 'airfoil_steady', 'pipe']:
-            geotype = 'structured_2D'
-            unified_pos = True
-            ref = 8
-            shapelist = [metadata['H'], metadata['W']]
-        elif cfg.dataset in ['elasticity', 'shapenet_car', 'lpbf'] or cfg.dataset.startswith('drivaerml'):
-            geotype = 'unstructured'
-            unified_pos = False
-            ref = 8
-            shapelist = None
-        else:
-            raise ValueError(f"Geotype not set for dataset {cfg.dataset}")
-
-        model_name = 'GNOT'
-        Model = pdebench.GNOT
-        model_args = dict(
-            n_experts=n_experts, n_heads=n_head, n_hidden=n_hidden,
-            n_layers=n_layers, mlp_ratio=mlp_ratio, unified_pos=unified_pos,
-            geotype=geotype, shapelist=shapelist, ref=ref, space_dim=c_in, fun_dim=0, out_dim=c_out,
-        )
-
-    elif cfg.model_type == 'upt':
-        #--------------------------------#
-        # UPT (Universal Physics Transformer)
-        #--------------------------------#
-        raise NotImplementedError("UPT is not implemented yet.")
-
-    elif cfg.model_type == 'lamo':
-        #--------------------------------#
-        # LaMO
-        #--------------------------------#
-        if cfg.use_defaults:
-            n_layers = 8
-            n_hidden = 128 if cfg.dataset not in ['airfrans', 'shapenet_car', 'navier_stokes'] else 256
-            slice_num = 64 if cfg.dataset not in ['airfrans', 'shapenet_car', 'navier_stokes'] else 32
-            n_head = 8
-            mlp_ratio = 1.0
-        else:
-            n_layers = cfg.num_blocks
-            n_hidden = cfg.channel_dim
-            slice_num = cfg.num_slices
-            n_head = cfg.num_heads
-            mlp_ratio = cfg.mlp_ratio
-
-        if cfg.conv2d:
-            model_name = 'LaMO_Structured_Mesh_2D'
-            Model = pdebench.LaMO_Structured_Mesh_2D
-            model_args = dict(
-                space_dim=c_in, out_dim=c_out, fun_dim=0,
-                n_hidden=n_hidden, n_layers=n_layers,
-                n_head=n_head, mlp_ratio=mlp_ratio, slice_num=slice_num,
-                H=metadata['H'], W=metadata['W'],
-                unified_pos=cfg.unified_pos,
-            )
-        else:
-            model_name = 'LaMO'
-            Model = pdebench.LaMO
-            model_args = dict(
-                space_dim=c_in, out_dim=c_out, fun_dim=0,
-                n_hidden=n_hidden, n_layers=n_layers,
-                n_head=n_head, mlp_ratio=mlp_ratio, slice_num=slice_num,
-            )
-
-    elif cfg.model_type == 'perceiverio':
-        #--------------------------------#
-        # PerceiverIO
-        #--------------------------------#
-        if cfg.use_defaults:
-            cfg.epochs = 250 if cfg.dataset in ['shapenet_car', 'lpbf'] else 500
-            if cfg.dataset in ['elasticity', 'darcy', 'airfoil_steady', 'pipe']:
-                cfg.batch_size = 2
-            elif cfg.dataset in ['shapenet_car', 'lpbf'] or cfg.dataset.startswith('drivaerml'):
-                cfg.batch_size = 1
-            else:
-                raise ValueError(f"Batch size not set for dataset {cfg.dataset}")
-            cfg.learning_rate = 1e-3
-            cfg.opt_beta1 = 0.9
-            cfg.opt_beta2 = 0.999
-            cfg.schedule = 'OneCycleLR'
-            cfg.one_cycle_pct_start = 0.1
-            cfg.one_cycle_div_factor = 25
-            cfg.one_cycle_final_div_factor = 1e4
-            cfg.one_cycle_override_min_lr = None
-            cfg.clip_grad_norm = 1.0
-            if cfg.dataset in ['shapenet_car']:
-                cfg.weight_decay = 5e-2
-            elif cfg.dataset in ['drivaerml_40k']:
-                cfg.weight_decay = 1e-4
-            elif cfg.dataset in ['lpbf']:
-                cfg.weight_decay = 1e-4
-            else:
-                cfg.weight_decay = 1e-5
-
-            # model params
-            channel_dim = 128
-            num_blocks = 8
-            num_heads = channel_dim // 16
-            mlp_ratio = 4.0
-            act = None
-            num_latents = 512
-            cross_attn = cfg.pcvr_cross_attn
-        else:
-            channel_dim = cfg.channel_dim
-            num_blocks = cfg.num_blocks
-            num_heads = cfg.num_heads
-            mlp_ratio = cfg.mlp_ratio
-            act = cfg.act
-            num_latents = cfg.num_latents
-            cross_attn = cfg.pcvr_cross_attn
-
-        model_name = 'PerceiverIO'
-        Model = pdebench.PerceiverIO
-        model_args = dict(
-            in_dim=c_in, out_dim=c_out, channel_dim=channel_dim,
-            num_blocks=num_blocks, num_heads=num_heads, mlp_ratio=mlp_ratio,
-            num_latents=num_latents, act=act,
-            cross_attn=cross_attn,
-        )
-
-    elif cfg.model_type == 'transformer':
-        #--------------------------------#
-        # Vanilla Transformer (softmax attention)
-        #--------------------------------#
-        if cfg.use_defaults:
-            cfg.epochs = 250 if cfg.dataset in ['shapenet_car', 'lpbf'] else 500
-            if cfg.dataset in ['elasticity', 'darcy', 'airfoil_steady', 'pipe']:
-                cfg.batch_size = 2
-            elif cfg.dataset in ['shapenet_car', 'lpbf'] or cfg.dataset.startswith('drivaerml'):
-                cfg.batch_size = 1
-            else:
-                raise ValueError(f"Batch size not set for dataset {cfg.dataset}")
-            
-            # training params
-            cfg.optimizer = 'adamw'
-            cfg.learning_rate = 1e-3
-            cfg.opt_beta1 = 0.9
-            cfg.opt_beta2 = 0.999
-            cfg.opt_eps = 1e-6 if cfg.dataset in ['pipe'] else 1e-8
-            cfg.schedule = 'OneCycleLR'
-            cfg.one_cycle_pct_start = 0.1
-            cfg.one_cycle_div_factor = 25
-            cfg.one_cycle_final_div_factor = 1e4
-            cfg.one_cycle_override_min_lr = None
-            cfg.clip_grad_norm = 1.0
-            if cfg.dataset in ['shapenet_car']:
-                cfg.weight_decay = 5e-2
-            elif cfg.dataset in ['drivaerml_40k']:
-                cfg.weight_decay = 1e-4
-            elif cfg.dataset in ['lpbf']:
-                cfg.weight_decay = 1e-4
-            else:
-                cfg.weight_decay = 1e-5
-
-            # model params
-            channel_dim = 80
-            num_blocks = 8
-            num_heads = channel_dim // 16
-            mlp_ratio = 4.0
-            act = None
-            rmsnorm = False
-            out_proj_norm = True
-            num_layers_in_out_proj = 2
-
-        else:
-            channel_dim = cfg.channel_dim
-            num_blocks = cfg.num_blocks
-            num_heads = cfg.num_heads
-            mlp_ratio = cfg.mlp_ratio
-            act = cfg.act
-            rmsnorm = cfg.rmsnorm
-            out_proj_norm = cfg.out_proj_norm
-            num_layers_in_out_proj = cfg.num_layers_in_out_proj
-
-        backend_kwargs = dict(
-            mlp_ratio=mlp_ratio,
-        )
-
-        model_name = 'Transformer'
-        Model = pdebench.TransformerWrapper
-        model_args = dict(
-            in_dim=c_in,
-            out_dim=c_out,
-            channel_dim=channel_dim,
-            num_blocks=num_blocks,
-            num_heads=num_heads,
-            act=act,
-            rmsnorm=rmsnorm,
-            #
-            out_proj_norm=out_proj_norm,
-            num_layers_in_out_proj=num_layers_in_out_proj,
-            #
-            backend='transformer',
-            **backend_kwargs,
-        )
-
-    elif cfg.model_type == 'linformer':
-        #--------------------------------#
-        # Linformer
-        #--------------------------------#
-        backend_kwargs = dict(
-            mlp_ratio=cfg.mlp_ratio,
-            seq_len=metadata['max_length'],
-            k=cfg.linformer_k,
-        )
-        
-        model_name = 'Linformer'
-        Model = pdebench.TransformerWrapper
-        model_args = dict(
-            in_dim=c_in,
-            out_dim=c_out,
-            channel_dim=cfg.channel_dim,
-            num_blocks=cfg.num_blocks,
-            num_heads=cfg.num_heads,
-            act=cfg.act,
-            rmsnorm=cfg.rmsnorm,
-            #
-            out_proj_norm=cfg.out_proj_norm,
-            num_layers_in_out_proj=cfg.num_layers_in_out_proj,
-            #
-            backend='linformer',
-            **backend_kwargs,
-        )
-
-    elif cfg.model_type == 'linear':
-        #--------------------------------#
-        # Linear attention
-        #--------------------------------#
-        backend_kwargs = dict(
-            mlp_ratio=cfg.mlp_ratio,
-            kernel=cfg.kernel,
-            norm_q=cfg.norm_q,
-            norm_k=cfg.norm_k,
-        )
-
-        model_name = 'Linear'
-        Model = pdebench.TransformerWrapper
-        model_args = dict(
-            in_dim=c_in,
-            out_dim=c_out,
-            channel_dim=cfg.channel_dim,
-            num_blocks=cfg.num_blocks,
-            num_heads=cfg.num_heads,
-            act=cfg.act,
-            rmsnorm=cfg.rmsnorm,
-            #
-            out_proj_norm=cfg.out_proj_norm,
-            num_layers_in_out_proj=cfg.num_layers_in_out_proj,
-            #
-            backend='linear',
-            **backend_kwargs,
-        )
-
-    # elif cfg.model_type in ['multilinear', 'triple', 'quad', 'strassen']:
-    #     #--------------------------------#
-    #     # Multilinear, Triple, Quad, Strassen attention
-    #     #--------------------------------#
-    #     if GLOBAL_RANK == 0:
-    #         name_dict = {
-    #                 'multilinear': 'MultilinearAttention',
-    #                 'triple': 'TripleAttention',
-    #                 'quad': 'QuadAttention',
-    #                 'strassen': 'StrassenAttention',
-    #                 }
-    #     backend_kwargs = dict(
-    #         kernel=cfg.kernel,
-    #         norm_q=cfg.norm_q,
-    #         norm_k=cfg.norm_k,
-    #         num_layers_kv_proj=cfg.num_layers_kv_proj,
-    #         kv_proj_mlp_ratio=cfg.kv_proj_mlp_ratio,
-    #         qk_dim_ratio=cfg.qk_dim_ratio,
-    #         #
-    #         num_layers_ffn=cfg.num_layers_ffn,
-    #         ffn_mlp_ratio=cfg.ffn_mlp_ratio,
-    #     )
-
-    #     if cfg.model_type == 'multilinear':
-    #         backend_kwargs['num_states'] = cfg.num_states
-    #     elif cfg.model_type == 'triple':
-    #         backend_kwargs['use_triton'] = cfg.use_triton
-            
-    #     model_name = name_dict[cfg.model_type]
-    #     Model = pdebench.TransformerWrapper
-    #     model_args = dict(
-    #         in_dim=c_in,
-    #         out_dim=c_out,
-    #         channel_dim=cfg.channel_dim,
-    #         num_blocks=cfg.num_blocks,
-    #         num_heads=cfg.num_heads,
-    #         act=cfg.act,
-    #         rmsnorm=cfg.rmsnorm,
-    #         #
-    #         out_proj_norm=cfg.out_proj_norm,
-    #         num_layers_in_out_proj=cfg.num_layers_in_out_proj,
-    #         #
-    #         backend=cfg.model_type,
-    #         **backend_kwargs,
-    #     )
-    # elif cfg.model_type == 'triple1':
-    #     #--------------------------------#
-    #     # Triple1 attention
-    #     #--------------------------------#
-    #     backend_kwargs = dict(
-    #         mlp_ratio=cfg.mlp_ratio,
-    #         qk_dim_ratio=cfg.qk_dim_ratio,
-    #         use_triton=cfg.use_triton,
-    #     )
-
-    #     model_name = 'Triple1Attention'
-    #     Model = pdebench.TransformerWrapper
-    #     model_args = dict(
-    #         in_dim=c_in,
-    #         out_dim=c_out,
-    #         channel_dim=cfg.channel_dim,
-    #         num_blocks=cfg.num_blocks,
-    #         num_heads=cfg.num_heads,
-    #         act=cfg.act,
-    #         rmsnorm=cfg.rmsnorm,
-    #         #
-    #         out_proj_norm=cfg.out_proj_norm,
-    #         num_layers_in_out_proj=cfg.num_layers_in_out_proj,
-    #         #
-    #         backend=cfg.model_type,
-    #         **backend_kwargs,
-    #     )
-
-    elif cfg.model_type == 'flare':
-        #--------------------------------#
-        # FLARE
-        #--------------------------------#
-        assert cfg.attn_scale in ['sqrt', 'one'], f"Invalid attn_scale: {cfg.attn_scale}. Choose from: sqrt, one."
-        assert cfg.channel_dim % cfg.num_heads == 0, f"channel_dim must be divisible by num_heads. Got {cfg.channel_dim} and {cfg.num_heads}."
-        head_dim = cfg.channel_dim // cfg.num_heads
-        cfg.attn_scale = (head_dim ** -0.5) if cfg.attn_scale == 'sqrt' else 1.0
-
-        backend_kwargs = dict(
-            attn_scale=cfg.attn_scale,
-            num_latents=cfg.num_latents,
-            num_layers_k_proj=cfg.num_layers_k_proj,
-            num_layers_v_proj=cfg.num_layers_v_proj,
-            k_proj_mlp_ratio=cfg.k_proj_mlp_ratio,
-            v_proj_mlp_ratio=cfg.v_proj_mlp_ratio,
-            num_layers_ffn=cfg.num_layers_ffn,
-            ffn_mlp_ratio=cfg.ffn_mlp_ratio,
-            qk_norm=cfg.qk_norm,
-        )
-
-        model_name = 'FLARE'
-        Model = pdebench.FLAREModel
-        model_args = dict(
-            in_dim=c_in,
-            out_dim=c_out,
-            channel_dim=cfg.channel_dim,
-            num_blocks=cfg.num_blocks,
-            num_heads=cfg.num_heads,
-            act=cfg.act,
-            rmsnorm=cfg.rmsnorm,
-            out_proj_norm=cfg.out_proj_norm,
-            num_layers_in_out_proj=cfg.num_layers_in_out_proj,
-            **backend_kwargs,
-        )
-
-    elif cfg.model_type == 'flare_experimental':
-        #--------------------------------#
-        # FLARE
-        #--------------------------------#
-        assert cfg.attn_scale in ['sqrt', 'one'], f"Invalid attn_scale: {cfg.attn_scale}. Choose from: sqrt, one."
-        assert cfg.channel_dim % cfg.num_heads == 0, f"channel_dim must be divisible by num_heads. Got {cfg.channel_dim} and {cfg.num_heads}."
-        head_dim = cfg.channel_dim // cfg.num_heads
-        cfg.attn_scale = (head_dim ** -0.5) if cfg.attn_scale == 'sqrt' else 1.0
-
-        backend_kwargs = dict(
-            attn_scale=cfg.attn_scale,
-            num_latents=cfg.num_latents,
-            num_layers_k_proj=cfg.num_layers_k_proj,
-            num_layers_v_proj=cfg.num_layers_v_proj,
-            k_proj_mlp_ratio=cfg.k_proj_mlp_ratio,
-            v_proj_mlp_ratio=cfg.v_proj_mlp_ratio,
-            num_layers_ffn=cfg.num_layers_ffn,
-            ffn_mlp_ratio=cfg.ffn_mlp_ratio,
-            qk_norm=cfg.qk_norm,
-        )
-
-        model_name = 'FLARE-Experimental'
-        Model = pdebench.FLAREExperimentalModel
-        model_args = dict(
-            in_dim=c_in,
-            out_dim=c_out,
-            channel_dim=cfg.channel_dim,
-            num_blocks=cfg.num_blocks,
-            num_heads=cfg.num_heads,
-            act=cfg.act,
-            rmsnorm=cfg.rmsnorm,
-            out_proj_norm=cfg.out_proj_norm,
-            num_layers_in_out_proj=cfg.num_layers_in_out_proj,
-            **backend_kwargs,
-        )
-
-    # elif cfg.model_type == 'loopy':
-    #     #--------------------------------#
-    #     # Loopy Transformer
-    #     #--------------------------------#
-    #     assert cfg.attn_scale in ['sqrt', 'one'], f"Invalid attn_scale: {cfg.attn_scale}. Choose from: sqrt, one."
-    #     assert cfg.channel_dim % cfg.num_heads == 0, f"channel_dim must be divisible by num_heads. Got {cfg.channel_dim} and {cfg.num_heads}."
-    #     head_dim = cfg.channel_dim // cfg.num_heads
-    #     cfg.attn_scale = (head_dim ** -0.5) if cfg.attn_scale == 'sqrt' else 1.0
-
-    #     backend_kwargs = dict(
-    #         attn_scale=cfg.attn_scale,
-    #         num_latents=cfg.num_latents,
-    #         num_layers_kv_proj=cfg.num_layers_kv_proj,
-    #         kv_proj_mlp_ratio=cfg.kv_proj_mlp_ratio,
-    #         num_layers_ffn=cfg.num_layers_ffn,
-    #         ffn_mlp_ratio=cfg.ffn_mlp_ratio,
-    #     )
-        
-    #     model_name = 'Loopy'
-    #     Model = pdebench.LoopyWrapper
-    #     model_args = dict(
-    #         in_dim=c_in,
-    #         out_dim=c_out,
-    #         channel_dim=cfg.channel_dim,
-    #         num_blocks=cfg.num_blocks,
-    #         num_heads=cfg.num_heads,
-    #         act=cfg.act,
-    #         rmsnorm=cfg.rmsnorm,
-    #         out_proj_norm=cfg.out_proj_norm,
-    #         num_layers_in_out_proj=cfg.num_layers_in_out_proj,
-    #         num_passes=cfg.num_passes,
-    #         **backend_kwargs,
-    #     )
-
-    # elif cfg.model_type == 'unloopy':
-    #     #--------------------------------#
-    #     # Unloopy Transformer
-    #     #--------------------------------#
-    #     assert cfg.attn_scale in ['sqrt', 'one'], f"Invalid attn_scale: {cfg.attn_scale}. Choose from: sqrt, one."
-    #     assert cfg.channel_dim % cfg.num_heads == 0, f"channel_dim must be divisible by num_heads. Got {cfg.channel_dim} and {cfg.num_heads}."
-    #     head_dim = cfg.channel_dim // cfg.num_heads
-    #     cfg.attn_scale = (head_dim ** -0.5) if cfg.attn_scale == 'sqrt' else 1.0
-
-    #     backend_kwargs = dict(
-    #         attn_scale=cfg.attn_scale,
-    #         num_latents=cfg.num_latents,
-    #         num_layers_kv_proj=cfg.num_layers_kv_proj,
-    #         kv_proj_mlp_ratio=cfg.kv_proj_mlp_ratio,
-    #         num_layers_ffn=cfg.num_layers_ffn,
-    #         ffn_mlp_ratio=cfg.ffn_mlp_ratio,
-    #     )
-        
-    #     model_name = 'Unloopy'
-    #     Model = pdebench.UnloopyWrapper
-    #     model_args = dict(
-    #         in_dim=c_in,
-    #         out_dim=c_out,
-    #         channel_dim=cfg.channel_dim,
-    #         num_blocks=cfg.num_blocks,
-    #         num_heads=cfg.num_heads,
-    #         act=cfg.act,
-    #         rmsnorm=cfg.rmsnorm,
-    #         out_proj_norm=cfg.out_proj_norm,
-    #         num_layers_in_out_proj=cfg.num_layers_in_out_proj,
-    #         shared_ffn=cfg.shared_ffn,
-    #         shared_att=cfg.shared_att,
-    #         gating=cfg.gating,
-    #         num_layers_gating_proj=cfg.num_layers_gating_proj,
-    #         gating_proj_mlp_ratio=cfg.gating_proj_mlp_ratio,
-    #         **backend_kwargs,
-    #     )
-
-    elif cfg.model_type == 'flare_ablations':
-        #--------------------------------#
-        # BigFLARE (ablations)
-        #--------------------------------#
-        model_name = 'BigFLARE'
-        Model = pdebench.BigFLAREModel
-        model_args = dict(
-            in_dim=c_in,
-            out_dim=c_out,
-            channel_dim=cfg.channel_dim,
-            num_blocks=cfg.num_blocks,
-            num_latents=cfg.num_latents,
-            num_heads=cfg.num_heads,
-            act=cfg.act,
-            num_layers_kv_proj=cfg.num_layers_kv_proj,
-            num_layers_mlp=cfg.num_layers_ffn,
-            num_layers_in_out_proj=cfg.num_layers_in_out_proj,
-            mlp_ratio=cfg.ffn_mlp_ratio,
-            kv_proj_ratio=cfg.kv_proj_mlp_ratio,
-            in_out_proj_ratio=cfg.in_out_proj_ratio,
-            out_proj_ln=cfg.out_proj_norm,
-            shared_latents=cfg.shared_att,
-            num_latent_blocks=cfg.num_passes,
-        )
-
-    else:
-        #--------------------------------#
-        # No model selected
-        #--------------------------------#
-        raise NotImplementedError(f"Model type {cfg.model_type} not implemented.")
-
-    if GLOBAL_RANK == 0:
-        model_args_str = ''.join([f"\t{k}={v}\n" for k, v in model_args.items()])
-        print(f"Using {model_name}(c_in={c_in}, c_out={c_out}) with\n" + model_args_str)
-
-    model = Model(**model_args)
-
-    return cfg, model
-
-#======================================================================#
-def main(cfg, device):
     DISTRIBUTED = mlutils.is_torchrun()
     GLOBAL_RANK = int(os.environ['RANK']) if DISTRIBUTED else 0
+    WORLD_SIZE = int(os.environ['WORLD_SIZE']) if DISTRIBUTED else 1
+    run_cfg = cfg.run
+    dataset_cfg = cfg.dataset
+    training_cfg = cfg.training
+    optimizer_cfg = cfg.optimizer
+    scheduler_cfg = cfg.scheduler
+    model_cfg = cfg.model
+    dataset = dataset_cfg.dataset
+    model_type = model_cfg.model
+    glt_topology = model_type == "glt"
 
-    case_dir = os.path.join(CASEDIR, cfg.exp_name)
+    case_dir = os.path.join(CASEDIR, run_cfg.exp_name)
 
     #=================#
     # DATA
     #=================#
 
-    mesh = cfg.model_type in ['mesh_model',]  # placeholder for mesh-based models
-    _data, data_, metadata = pdebench.load_dataset(cfg.dataset, DATADIR_BASE, PROJDIR, mesh=mesh)
+    data_root = dataset_cfg.data_root if dataset_cfg.data_root is not None else DATADIR_BASE
+    resolved_dataset = resolve_dataset_name(dataset.lower())
+    is_plaid = resolved_dataset in PLAID_DATASETS or resolved_dataset.startswith("plaid_")
+    mesh = is_plaid or (model_type in MESH_GRAPH_MODELS)
+    mesh_graph_backend = "pyg"
+    ginot_use_flash_varlen = resolve_use_flash_varlen(
+        model_type=model_type,
+        dataset_name=dataset,
+        mixed_precision=bool(training_cfg.mixed_precision),
+        use_context_parallel=bool(training_cfg.use_context_parallel),
+    )
+    if ginot_use_flash_varlen and GLOBAL_RANK == 0:
+        print(
+            "Packed flash-attn varlen workflow selected (GLT, or mixed-precision FLARE/GITO on "
+            "GINOT/LPBF varlen batches). No masked-SDPA fallback will be used; unsupported "
+            "dtype/device/metadata will fail loudly."
+        )
+    if ginot_use_flash_varlen:
+        try:
+            import flash_attn  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "Packed flash-attn varlen requires flash-attn. "
+                "Install flash-attn, disable mixed_precision, or use a dense/padded path "
+                "(e.g. nasa_crm / context parallel)."
+            ) from exc
+    ginot_pipeline = uses_ginot_pipeline(dataset, model_type)
+    if glt_topology:
+        pe_feature_request = model_cfg.pe.to_feature_request()
+        feature_request = FeatureRequest(
+            edges=pe_feature_request.edges or (model_type in EDGE_INFO_MODELS),
+            boundary=pe_feature_request.boundary,
+            laplacian_k=pe_feature_request.laplacian_k,
+            laplacian_spec=pe_feature_request.laplacian_spec,
+            pos_domain=bool(pe_feature_request.pos_domain),
+        )
+    else:
+        feature_request = FeatureRequest(
+            edges=(model_type in EDGE_INFO_MODELS),
+            boundary=False,
+        )
+    load_kwargs = dict(
+        mesh=mesh,
+        ginot_use_flash_varlen=ginot_use_flash_varlen,
+        model_type=model_type,
+        feature_request=feature_request,
+    )
+    if ginot_pipeline:
+        load_kwargs.update(
+            mesh_split_seed=dataset_cfg.mesh_split_seed,
+            ginot_max_samples=dataset_cfg.max_samples,
+        )
+    elif is_plaid:
+        load_kwargs.update(
+            mesh_split_seed=run_cfg.seed,
+            plaid_use_sdf_features=dataset_cfg.plaid_use_sdf_features,
+            plaid_load_public_test=dataset_cfg.plaid_load_public_test,
+            plaid_terminal_y_norm=dataset_cfg.plaid_terminal_y_norm,
+            plaid_terminal_target_fields=dataset_cfg.plaid_terminal_target_fields,
+            plaid_max_samples=dataset_cfg.max_samples,
+        )
+    elif dataset in ("ahmedml_surface", "drivaerml_surface"):
+        load_kwargs["subset_size"] = dataset_cfg.subset_size
+        load_kwargs["iid_samples"] = dataset_cfg.iid_samples
+    timer.mark("dataset_load_start")
+    _data, data_, metadata = pdebench.load_dataset(
+        dataset,
+        data_root,
+        PROJDIR,
+        **load_kwargs,
+    )
+    timer.mark("dataset_loaded")
 
     if metadata is None:
         raise ValueError("metadata is None. Check pdebench.load_dataset and your dataset path/configuration.")
+    metadata["dataset"] = resolved_dataset
+    metadata["model"] = model_type
+    if dataset == "ahmedml_surface":
+        if metadata.get("ahmedml_train_run_data") is None or metadata.get("ahmedml_test_run_data") is None:
+            raise ValueError("ahmedml_surface metadata missing ahmedml_train_run_data / ahmedml_test_run_data")
+        metadata["rel_l2_loss"] = bool(dataset_cfg.rel_l2_loss)
+    elif dataset == "drivaerml_surface":
+        if metadata.get("drivaerml_train_run_data") is None or metadata.get("drivaerml_test_run_data") is None:
+            raise ValueError("drivaerml_surface metadata missing drivaerml_train_run_data / drivaerml_test_run_data")
+        metadata["rel_l2_loss"] = bool(dataset_cfg.rel_l2_loss)
+    lpbf_graph_cache = dataset in LPBF_DATASETS and (
+        bool(metadata.get("ginot_include_edges")) or model_type == "glt"
+    )
 
     if GLOBAL_RANK == 0:
-        print(f"Loaded {cfg.dataset} dataset with {len(_data)} train and {len(data_)} test cases.")
-        # print(f"Number of points: {len(next(_data))}")
+        test_count = 0 if data_ is None else len(data_)
+        print(
+            f"Loaded {dataset} dataset with {len(_data)} train and {test_count} test cases "
+            f"(elapsed={timer.elapsed('dataset_loaded'):.3f}s)."
+        )
+        train_mean_nodes = metadata.get("ginot_train_mean_nodes_per_run")
+        if train_mean_nodes is not None:
+            print(
+                f"GINOT train node counts: mean_per_run={float(train_mean_nodes):.6f}; "
+                f"mean_per_batch_bs1={float(metadata['ginot_train_mean_nodes_per_batch_bs1']):.6f}."
+            )
+
+    from pdebench.dataset.pos_domain import maybe_attach_pos_domain
+
+    if glt_topology and feature_request.pos_domain:
+        timer.mark("pos_domain_scan_start")
+        metadata = maybe_attach_pos_domain(
+            metadata,
+            _data,
+            batch_size=int(training_cfg.batch_size),
+            feature_request=feature_request,
+            num_workers=0,
+        )
+        timer.mark("pos_domain_scan_done")
+        if GLOBAL_RANK == 0:
+            expanse = metadata["pos_domain"].normalized_pos_expanse
+            print(
+                f"PosDomain normalized_pos_expanse={expanse.tolist()} "
+                f"(elapsed={timer.elapsed('pos_domain_scan_done'):.3f}s)."
+            )
 
     #=================#
     # MODEL
     #=================#
 
+    timer.mark("model_build_start")
     cfg, model = make_model(cfg, metadata, GLOBAL_RANK)
+    timer.mark("model_built")
+
+    if run_cfg.train and GLOBAL_RANK == 0:
+        config_file = os.path.join(case_dir, 'config.yaml')
+        with open(config_file, 'w') as f:
+            yaml.safe_dump(cfg.to_dict(), f)
+
+    if dataset == 'navier_stokes' and training_cfg.use_context_parallel:
+        raise NotImplementedError("Navier-Stokes rollout training does not yet support context parallelism.")
+    if dataset == 'plasticity' and training_cfg.use_context_parallel:
+        raise NotImplementedError("Plasticity time-conditioned training does not yet support context parallelism.")
 
     # Handle time-conditioned models
-    if metadata['time_cond']:
+    if metadata['time_cond'] and dataset not in ['plasticity'] and not mesh_static_supports_time_cond(dataset):
         raise NotImplementedError("Time-conditioned models not implemented in this repository.")
+
+    cp_state = None
+    cp_preprocess_fn = None
+    preprocess_fns = []
+    if training_cfg.use_context_parallel:
+        if not DISTRIBUTED:
+            raise ValueError("use_context_parallel=True requires torchrun/distributed execution.")
+        cp_state = build_context_parallel_state(training_cfg.context_parallel_size)
+        if not hasattr(model, "set_context_parallel"):
+            raise ValueError(
+                f"Model type '{model_type}' does not expose set_context_parallel; "
+                "CP requires a model that knows how to shard and reduce its sequence-aligned tensors."
+            )
+        model.set_context_parallel(
+            cp_state=cp_state,
+            cp_debug_gather_outputs=training_cfg.cp_debug_gather_outputs,
+        )
+
+        if GLOBAL_RANK == 0:
+            print(
+                f"Context parallel enabled: cp_size={cp_state.cp_size}, "
+                f"global_world={cp_state.world_size}, cp_sequence_dim={training_cfg.cp_sequence_dim}."
+            )
+
+        def _cp_preprocess_fn(batch):
+            return shard_batch(batch=batch, cp_state=cp_state, seq_dim=training_cfg.cp_sequence_dim)
+
+        cp_preprocess_fn = _cp_preprocess_fn
+        preprocess_fns.append(cp_preprocess_fn)
 
     if GLOBAL_RANK == 0:
         print(f"Parameters: {sum(p.numel() for p in model.parameters())}")
 
     # compute timings over 1 epoch with batch size 1
-    if cfg.timing_only:
-        cfg.batch_size = 1
-        cfg.epochs = 2
+    if run_cfg.timing_only:
+        training_cfg.batch_size = 1
+        training_cfg.epochs = 2
 
     #=================#
     # MAKE TRAINER
@@ -813,131 +290,403 @@ def main(cfg, device):
     #----------#
 
     callback = mlutils.Callback(case_dir)
+    drivaerml_1m_use_normalized_mse = (dataset == 'drivaerml_1m')
 
-    if cfg.dataset in ['airfoil_dynamic', 'cylinder_flow']:
-        from pdebench.callbacks_timeseries import TimeseriesCallback
-        callback = TimeseriesCallback(case_dir, mesh=mesh)
-    elif cfg.dataset in [
-        'elasticity', 'plasticity', 'darcy', 'airfoil_steady', 'pipe', 'navier_stokes',
-        'shapenet_car', 'airfrans', 'am_small',
-    ] or cfg.dataset.startswith('drivaerml'):
-        callback = pdebench.RelL2Callback(case_dir, cfg.dataset, metadata['x_normalizer'], metadata['y_normalizer'])
-    elif cfg.dataset in ['lpbf']:
+    if dataset in ['navier_stokes']:
+        callback = pdebench.NavierStokesCallback(case_dir)
+    elif dataset in ['plasticity']:
+        callback = pdebench.PlasticityCallback(case_dir)
+    elif is_plaid:
+        callback = pdebench.MeshStaticCallback(
+            case_dir=case_dir,
+            model_type=model_type,
+            y_normalizer=metadata['y_normalizer'],
+            y_scalar_normalizer=metadata.get('y_scalar_normalizer'),
+            target_fields=metadata.get('target_fields'),
+            target_scalar_fields=metadata.get('target_scalar_fields'),
+            test_data=metadata.get('mesh_test_data'),
+            dataset_name=dataset,
+        )
+    elif dataset == 'ahmedml_surface':
+        callback = pdebench.AhmedMLSurfaceRelL2Callback(
+            case_dir,
+            dataset,
+            metadata['x_normalizer'],
+            metadata['y_normalizer'],
+            y_field_slices=metadata.get('y_field_slices'),
+            y_field_metrics=metadata.get('y_field_metrics'),
+        )
+    elif dataset == 'drivaerml_surface':
+        callback = pdebench.DrivAerMLSurfaceRelL2Callback(
+            case_dir,
+            dataset,
+            metadata['x_normalizer'],
+            metadata['y_normalizer'],
+            y_field_slices=metadata.get('y_field_slices'),
+            y_field_metrics=metadata.get('y_field_metrics'),
+        )
+    elif dataset in [
+        'elasticity', 'darcy', 'airfoil_steady', 'pipe',
+        'shapenet_car', 'nasa_crm', 'airfrans', 'am_small',
+    ] or (dataset.startswith('drivaerml') and not drivaerml_1m_use_normalized_mse):
+        callback = pdebench.RelL2Callback(
+            case_dir,
+            dataset,
+            metadata['x_normalizer'],
+            metadata['y_normalizer'],
+            y_field_slices=metadata.get('y_field_slices'),
+            y_field_metrics=metadata.get('y_field_metrics'),
+        )
+    elif dataset in LPBF_DATASETS and not lpbf_graph_cache:
         import am
         callback = am.FinaltimeCallback(case_dir, mesh=mesh, num_eval_cases=20)
-    elif cfg.dataset in ['am_dynamic']:
+    elif dataset in ['am_dynamic']:
         import am
 
         callback = am.TimeseriesCallback(case_dir, mesh=mesh, num_eval_cases=20, autoreg_start=1)
 
     # use scores callback in eval mode
-    if cfg.model_type in ['flare', 'flare_ablations'] and cfg.evaluate and cfg.dataset in [
+    if model_type in ['flare', 'flare_ablations'] and run_cfg.evaluate and dataset in [
         'elasticity', 'darcy', 'airfoil_steady', 'shapenet_car', 'airfrans',
     ]:
         callback = pdebench.ScoresCallback(case_dir)
 
     #----------#
-    # batch_size
+    # batch_size (global unless context-parallel sets batch_size_is_per_rank below)
     #----------#
 
-    _batch_size  = cfg.batch_size
-    if cfg.dataset in [
+    _batch_size = training_cfg.batch_size
+    if ginot_pipeline:
+        batch_size_ = _batch_size_ = _batch_size
+    elif dataset in ['navier_stokes', 'plasticity']:
+        batch_size_ = _batch_size_ = _batch_size
+    elif model_type == 'transolver' and dataset in ['elasticity']:
+        batch_size_ = _batch_size_ = _batch_size
+    elif is_plaid:
+        batch_size_ = _batch_size_ = _batch_size
+    elif dataset in [
         'elasticity', 'plasticity', 'darcy', 'airfoil_steady', 'pipe', 'navier_stokes',
     ]:
         batch_size_ = _batch_size_ = 5
-    elif cfg.dataset in ['lpbf', 'airfoil_dynamic', 'cylinder_flow']:
-        batch_size_ = _batch_size_ = 1
-        assert _batch_size == WORLD_SIZE, f"Local batch size must be 1 for dataset {cfg.dataset}. Got batch_size={_batch_size} with WORLD_SIZE={WORLD_SIZE}."
+    elif dataset in LPBF_DATASETS:
+        # Multi-graph FLARE: padded+mask or flat varlen (see lpbf_batch_format).
+        batch_size_ = _batch_size_ = _batch_size
+        if _batch_size % WORLD_SIZE != 0:
+            raise ValueError(
+                f"Global batch_size={_batch_size} must be divisible by WORLD_SIZE={WORLD_SIZE} for LPBF."
+            )
     else:
         batch_size_ = _batch_size_ = 1
 
-    gnn_loader = cfg.dataset in ['lpbf', 'airfoil_dynamic', 'cylinder_flow']
+    _graph_native_datasets = LPBF_DATASETS
+    gnn_loader = (
+        dataset in _graph_native_datasets
+        and not ginot_pipeline
+        and not metadata.get("ginot_include_edges")
+    )
+    graph_loader_backend = 'pyg' if gnn_loader else None
+    if model_type in MESH_SEQUENCE_MODELS and dataset not in _graph_native_datasets:
+        gnn_loader = False
+        graph_loader_backend = None
+    elif is_plaid:
+        gnn_loader = model_type in MESH_GRAPH_MODELS
+        graph_loader_backend = mesh_graph_backend if gnn_loader else None
+        if metadata.get("sample_collate") and gnn_loader:
+            # C4: the dataset yields Sample (not Data) for this family, but
+            # torch_geometric.loader.DataLoader always builds its own Collater
+            # and ignores any collate_fn passed to it, so a Sample-yielding
+            # dataset would crash under the pyg graph loader. Route through the
+            # plain torch DataLoader instead so metadata['train_collate_fn'] /
+            # ['eval_collate_fn'] (collate_plaid_static) actually runs.
+            gnn_loader = False
+            graph_loader_backend = None
 
     #----------#
     # make_optimizer
     #----------#
 
-    if cfg.optimizer in ['adamw', 'adam']:
-        make_optimizer = pdebench.make_optimizer_adamw
-    elif cfg.optimizer == 'lion':
+    if optimizer_cfg.optimizer == 'adam':
+        def make_optimizer(model, lr, weight_decay=0.0, beta1=0.9, beta2=0.999, eps=1e-8):
+            return torch.optim.Adam(
+                model.parameters(),
+                lr=lr,
+                weight_decay=weight_decay,
+                betas=(beta1, beta2),
+                eps=eps,
+            )
+    elif optimizer_cfg.optimizer == 'adamw':
+        if model_type == 'transolver' and dataset in ['elasticity', 'navier_stokes', 'plasticity']:
+            make_optimizer = pdebench.make_optimizer_plain_adamw
+        else:
+            make_optimizer = pdebench.make_optimizer_adamw
+            c_stream_wd = optimizer_cfg.glt_c_stream_weight_decay
+            if (
+                c_stream_wd is not None
+                and model_type == 'glt'
+                and bool(getattr(model_cfg, 'pe_update', False))
+            ):
+                base_make_optimizer = make_optimizer
+
+                def make_optimizer(model, lr, weight_decay=0.0, beta1=0.9, beta2=0.999, eps=1e-8):
+                    return base_make_optimizer(
+                        model,
+                        lr,
+                        weight_decay=weight_decay,
+                        beta1=beta1,
+                        beta2=beta2,
+                        eps=eps,
+                        c_stream_weight_decay=float(c_stream_wd),
+                    )
+
+                if GLOBAL_RANK == 0:
+                    print(
+                        f"GLT dual-stream optimizer: weight_decay={optimizer_cfg.weight_decay} (x-stream), "
+                        f"glt_c_stream_weight_decay={c_stream_wd} (c_proj + blocks_c)"
+                    )
+    elif optimizer_cfg.optimizer == 'lion':
         make_optimizer = pdebench.make_optimizer_lion
-    elif cfg.optimizer == 'muon':
-        cfg.one_cycle_cycle_momentum = False
+    elif optimizer_cfg.optimizer == 'muon':
+        scheduler_cfg.cycle_momentum = False
         make_optimizer = pdebench.make_optimizer_muon
     else:
-        raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Choose from adamw, lion, muon.")
+        raise ValueError(f"Invalid optimizer: {optimizer_cfg.optimizer}. Choose from adamw, lion, muon.")
 
     #----------#
     # lossfun
     #----------#
 
-    if cfg.dataset in [
+    if ginot_pipeline:
+        if GLOBAL_RANK == 0:
+            print(f"Using per-channel relative L2 objective and stats for {dataset} GINOT dataset")
+        lossfun = None
+    elif is_plaid:
+        if GLOBAL_RANK == 0:
+            lbda = float(metadata.get("plaid_loss_lbda", 0.5))
+            scalars = metadata.get("target_scalar_fields", [])
+            print(
+                f"Using Vi-Transf λ-blended MSE objective and stats for {dataset} "
+                f"(lbda={lbda}, scalars={list(scalars)})"
+            )
+        lossfun = None
+    elif dataset in MSE_NORMALIZED_DATASETS:
+        # nasa_crm: MSE on normalized targets.
+        # ahmedml/drivaerml surfaces: MSE by default; optional physical Rel-L2 blend.
+        if dataset in ("ahmedml_surface", "drivaerml_surface") and bool(metadata.get("rel_l2_loss", False)):
+            if GLOBAL_RANK == 0:
+                print(
+                    f"Using 0.5*(pressure Rel-L2 + wall-shear Rel-L2) for {dataset} "
+                    "(physical units; per-batch and full-mesh)"
+                )
+
+            def lossfun(yh, y):
+                return surface_batch_loss(
+                    yh,
+                    y,
+                    rel_l2_loss=True,
+                    y_normalizer=metadata["y_normalizer"],
+                    cp_state=None,
+                )
+        else:
+            if GLOBAL_RANK == 0:
+                print(f"Using MSELoss (normalized) for {dataset} dataset")
+            lossfun = torch.nn.MSELoss()
+    elif (
+        (dataset in [
         'elasticity', 'plasticity', 'darcy', 'airfoil_steady', 'pipe', 'navier_stokes',
         'shapenet_car',
-    ] or cfg.dataset.startswith('drivaerml'):
+        ] or dataset.startswith('drivaerml'))
+        and not drivaerml_1m_use_normalized_mse
+    ):
         if GLOBAL_RANK == 0:
-            print(f"Using RelL2Loss for {cfg.dataset} dataset")
+            print(f"Using RelL2Loss for {dataset} dataset")
         lf = pdebench.RelL2Loss()
         def lossfun(yh, y):
             y_normalizer = metadata['y_normalizer'].to(y.device)
             yh = y_normalizer.decode(yh)
             y  = y_normalizer.decode(y)
             return lf(yh, y)
+    elif dataset in LPBF_DATASETS and lpbf_graph_cache:
+        if GLOBAL_RANK == 0:
+            print(f"Using per-channel relative L2 objective and stats for {dataset} LPBF graph-cache path")
+        lossfun = None
+    elif dataset in LPBF_DATASETS:
+        lpbf_batch_format = resolve_lpbf_batch_format(
+            mixed_precision=bool(training_cfg.mixed_precision),
+            explicit=metadata.get("lpbf_batch_format"),
+            use_context_parallel=bool(training_cfg.use_context_parallel),
+        )
+        metadata["lpbf_batch_format"] = lpbf_batch_format
+        lpbf_collate = make_lpbf_collate_fn(lpbf_batch_format)
+        metadata["train_collate_fn"] = lpbf_collate
+        metadata["eval_collate_fn"] = lpbf_collate
+        if GLOBAL_RANK == 0:
+            print(
+                f"Using LPBF physical channel-mean Rel-L2 ({lpbf_batch_format} batch format) "
+                f"for {dataset} dataset"
+            )
+        def lossfun(yh, y):
+            return lpbf_warped_rel_l2(yh, y, metadata['y_normalizer'])
     else:
         if GLOBAL_RANK == 0:
-            print(f"Using MSELoss for {cfg.dataset} dataset")
+            print(f"Using MSELoss for {dataset} dataset")
         lossfun = torch.nn.MSELoss()
 
     #----------#
     # Trainer kwargs
     #----------#
 
+    clip_grad_norm = training_cfg.clip_grad_norm
+    if model_type in {
+        "meshgraphnet",
+        "rigno",
+        "gito",
+        "geo_transolver",
+    }:
+        # Match PLAID MGN training loop (no gradient clipping).
+        clip_grad_norm = None
+
     kw = dict(
         # device & compilation
-        device=device, mixed_precision=cfg.mixed_precision,
-        compile_model=cfg.compile_model, static_graph=cfg.static_graph,
-        ddp_find_unused_params=False, ddp_gradient_as_bucket_view=True,
-        ema=cfg.ema, ema_decay=cfg.ema_decay,
+        device=device, mixed_precision=training_cfg.mixed_precision, amp_dtype=training_cfg.amp_dtype,
+        compile_model=training_cfg.compile_model,
+        static_graph=training_cfg.static_graph,
+        ddp_find_unused_params=(model_type == "glt" and model_cfg.pe_inject_mode == "concat_input"),
+        ddp_gradient_as_bucket_view=True,
+        ema=training_cfg.ema, ema_decay=training_cfg.ema_decay,
         # batch size
         _batch_size=_batch_size, batch_size_=batch_size_, _batch_size_=_batch_size_,
         # optimizer
-        make_optimizer=make_optimizer, weight_decay=cfg.weight_decay, epochs=cfg.epochs, steps=cfg.steps,
-        lossfun=lossfun, clip_grad_norm=cfg.clip_grad_norm,
-        opt_beta1=cfg.opt_beta1, opt_beta2=cfg.opt_beta2, opt_eps=cfg.opt_eps,
+        make_optimizer=make_optimizer,
+        weight_decay=optimizer_cfg.weight_decay,
+        epochs=training_cfg.epochs,
+        steps=training_cfg.steps,
+        lossfun=lossfun, clip_grad_norm=clip_grad_norm,
+        opt_beta1=optimizer_cfg.opt_beta1, opt_beta2=optimizer_cfg.opt_beta2, opt_eps=optimizer_cfg.opt_eps,
         # dataloader kwargs
-        num_workers=cfg.num_workers, prefetch_factor=cfg.prefetch_factor, gnn_loader=gnn_loader,
+        num_workers=training_cfg.num_workers, prefetch_factor=training_cfg.prefetch_factor,
+        overlap_train_dataloader=training_cfg.overlap_train_dataloader,
+        continuous_train_batches=training_cfg.continuous_train_batches,
+        gnn_loader=gnn_loader, graph_loader_backend=graph_loader_backend,
+        # stats controls
+        _fullbatch_stats=training_cfg.fullbatch_stats_train,
+        fullbatch_stats_=training_cfg.fullbatch_stats_test,
+        fullbatch_stats_on_start=training_cfg.fullbatch_stats_on_start,
+        stats_on_start=training_cfg.stats_on_start,
     )
+    # Keep training compiled when requested, but run full-batch stats eagerly for
+    # variable-length GINOT packs and full-mesh surface Rel-L2 (shape ≠ train 100k).
+    kw['compile_stats_model'] = compile_stats_model_for_dataset(dataset, model_type, training_cfg.compile_model)
+    if training_cfg.compile_model and not kw['compile_stats_model'] and GLOBAL_RANK == 0:
+        print("Using eager model for full-batch stats (variable-length / full-mesh eval).")
+    if dataset == 'navier_stokes':
+        kw['statsfun'] = make_navier_stokes_statsfun()
+    elif dataset == 'plasticity':
+        kw['statsfun'] = make_plasticity_statsfun()
+    elif dataset == 'ahmedml_surface':
+        kw['statsfun'] = make_ahmedml_surface_statsfun(metadata, cp_state=cp_state)
+    elif dataset == 'drivaerml_surface':
+        kw['statsfun'] = make_drivaerml_surface_statsfun(metadata, cp_state=cp_state)
+    elif is_plaid:
+        kw['statsfun'] = make_mesh_static_statsfun(cfg, metadata)
+    elif lpbf_graph_cache:
+        kw['statsfun'] = make_lpbf_statsfun(cfg, metadata)
+    elif ginot_pipeline:
+        kw['statsfun'] = make_ginot_statsfun(cfg, metadata)
+    if metadata.get('train_collate_fn') is not None:
+        kw['_collate_fn'] = metadata['train_collate_fn']
+    if is_plaid and model_type in MESH_SEQUENCE_MODELS:
+        kw['_collate_fn'] = mesh_sequence_collate_fn
+    if dataset == 'plasticity':
+        kw['schedule_step_multiplier'] = metadata.get('rollout_steps', 1)
+    if metadata.get('eval_collate_fn') is not None:
+        kw['collate_fn_'] = metadata['eval_collate_fn']
+    if is_plaid and model_type in MESH_SEQUENCE_MODELS:
+        kw['collate_fn_'] = mesh_sequence_collate_fn
+    if preprocess_fns:
+        def _combined_preprocess_fn(batch):
+            for preprocess_fn in preprocess_fns:
+                batch = preprocess_fn(batch)
+            return batch
+
+        kw["_preprocess_fn"] = _combined_preprocess_fn
+        kw["preprocess_fn_"] = _combined_preprocess_fn
+    if cp_preprocess_fn is not None:
+        kw["batch_size_is_per_rank"] = True
+        kw["use_distributed_sampler"] = False
+    if GLOBAL_RANK == 0:
+        if kw.get("batch_size_is_per_rank"):
+            print(
+                f"Training batch_size={_batch_size} (per_rank; context parallel, "
+                f"WORLD_SIZE={WORLD_SIZE})"
+            )
+        elif DISTRIBUTED:
+            print(
+                f"Training batch_size: global={_batch_size} per_rank={_batch_size // WORLD_SIZE} "
+                f"(WORLD_SIZE={WORLD_SIZE})"
+            )
+        else:
+            print(f"Training batch_size: global={_batch_size} (single process)")
+    if training_cfg.stats_every > 0:
+        kw['stats_every'] = training_cfg.stats_every
 
     #----------#
     # LR scheduler
     #----------#
 
-    if cfg.schedule is None or cfg.schedule == 'ConstantLR':
-        kw['lr'] = cfg.learning_rate
-    elif cfg.schedule == 'OneCycleLR':
+    if scheduler_cfg.schedule is None or scheduler_cfg.schedule == 'ConstantLR':
+        kw['lr'] = optimizer_cfg.learning_rate
+    elif scheduler_cfg.schedule == 'OneCycleLR':
 
-        if cfg.one_cycle_override_min_lr is not None:
-            cfg.one_cycle_div_factor = cfg.learning_rate / cfg.one_cycle_override_min_lr
-            cfg.one_cycle_final_div_factor = 1.0
+        if scheduler_cfg.override_min_lr is not None:
+            scheduler_cfg.div_factor = optimizer_cfg.learning_rate / scheduler_cfg.override_min_lr
+            scheduler_cfg.final_div_factor = 1.0
 
         kw['Schedule'] = 'OneCycleLR'
-        kw['lr'] = cfg.learning_rate
-        kw['one_cycle_pct_start'] = cfg.one_cycle_pct_start
-        kw['one_cycle_div_factor'] = cfg.one_cycle_div_factor
-        kw['one_cycle_final_div_factor'] = cfg.one_cycle_final_div_factor
-        kw['one_cycle_three_phase'] = cfg.one_cycle_three_phase
-        kw['one_cycle_cycle_momentum'] = cfg.one_cycle_cycle_momentum
-        kw['one_cycle_base_momentum'] = cfg.one_cycle_base_momentum
-        kw['one_cycle_max_momentum'] = cfg.one_cycle_max_momentum
-        kw['one_cycle_anneal_strategy'] = cfg.one_cycle_anneal_strategy
+        kw['lr'] = optimizer_cfg.learning_rate
+        kw['one_cycle_pct_start'] = scheduler_cfg.pct_start
+        kw['one_cycle_div_factor'] = scheduler_cfg.div_factor
+        kw['one_cycle_final_div_factor'] = scheduler_cfg.final_div_factor
+        kw['one_cycle_three_phase'] = scheduler_cfg.three_phase
+        kw['one_cycle_cycle_momentum'] = scheduler_cfg.cycle_momentum
+        kw['one_cycle_base_momentum'] = scheduler_cfg.base_momentum
+        kw['one_cycle_max_momentum'] = scheduler_cfg.max_momentum
+        kw['one_cycle_anneal_strategy'] = scheduler_cfg.anneal_strategy
     else:
-        kw = dict(**kw, Schedule=cfg.schedule, lr=cfg.learning_rate,)
+        kw = dict(**kw, Schedule=scheduler_cfg.schedule, lr=optimizer_cfg.learning_rate,)
+        if scheduler_cfg.schedule == 'ReduceLROnPlateau':
+            kw['plateau_factor'] = scheduler_cfg.plateau_factor
+            kw['plateau_patience'] = scheduler_cfg.plateau_patience
+        if scheduler_cfg.schedule == 'CosineAnnealingLR':
+            kw['min_lr'] = float(getattr(scheduler_cfg, 'min_lr', 0.0) or 0.0)
 
     #-------------#
     # make Trainer
     #-------------#
 
+    timer.mark("trainer_construct_start")
+    kw["run_timer"] = timer
     trainer = mlutils.Trainer(model, _data, data_, **kw)
+    timer.mark("trainer_constructed")
+
+    # Match PhysicsNeMo crash recipe: CosineAnnealingLR stepped once per epoch.
+    if (
+        scheduler_cfg.schedule == "CosineAnnealingLR"
+        and trainer.train_based_on_epochs
+        and int(getattr(trainer, "epochs", 0) or 0) > 0
+    ):
+        trainer.schedule = torch.optim.lr_scheduler.CosineAnnealingLR(
+            trainer.opt,
+            T_max=max(1, int(trainer.epochs)),
+            eta_min=float(getattr(scheduler_cfg, "min_lr", 0.0) or 0.0),
+        )
+        trainer.update_schedule_every_epoch = True
+    elif model_type == "transolver" and dataset == "elasticity":
+        trainer.schedule = torch.optim.lr_scheduler.CosineAnnealingLR(
+            trainer.opt,
+            T_max=trainer.epochs,
+            eta_min=0.0,
+        )
+        trainer.update_schedule_every_epoch = True
 
     #-------------#
     # add callback
@@ -947,10 +696,105 @@ def main(cfg, device):
     else:
         trainer.add_callback('batch_end', callback)
 
+    if model_type == 'mixer_backbone' and bool(getattr(model_cfg, 'diagnostics', False)):
+        trainer.add_callback('batch_end', pdebench.MixerDiagnosticsCallback(case_dir))
+
     #-------------#
     # batch_lossfun
     #-------------#
-    if cfg.dataset in ['darcy']:
+    if training_cfg.use_context_parallel:
+        # nasa_crm and surface datasets use MSE on normalized targets (falls through to cp_reduced_mse_loss).
+        rel_l2_datasets = {
+            'elasticity', 'plasticity', 'darcy', 'airfoil_steady', 'pipe', 'navier_stokes',
+            'shapenet_car',
+        }
+
+        def batch_lossfun(trainer, model, batch):
+            if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+                raise ValueError("CP training currently expects batch format (x, y, ...).")
+            x, y = batch[0], batch[1]
+            yh = model(x)
+
+            if dataset in ("ahmedml_surface", "drivaerml_surface"):
+                return surface_batch_loss(
+                    yh,
+                    y,
+                    rel_l2_loss=bool(metadata.get("rel_l2_loss", False)),
+                    y_normalizer=metadata["y_normalizer"],
+                    cp_state=cp_state,
+                )
+            if dataset in MSE_NORMALIZED_DATASETS:
+                return cp_reduced_mse_loss(yh, y, cp_state=cp_state)
+            if (
+                ((dataset in rel_l2_datasets) or dataset.startswith('drivaerml'))
+                and not drivaerml_1m_use_normalized_mse
+            ):
+                y_normalizer = metadata['y_normalizer'].to(y.device)
+                yh = y_normalizer.decode(yh)
+                y = y_normalizer.decode(y)
+                return cp_reduced_rel_l2_loss(yh, y, cp_state=cp_state)
+
+            return cp_reduced_mse_loss(yh, y, cp_state=cp_state)
+
+        trainer.batch_lossfun = batch_lossfun
+
+    elif is_plaid:
+        def batch_lossfun(trainer, model, batch):
+            yh, y, batch_index, num_graphs = mesh_model_forward(cfg, model, batch)
+            if y is None:
+                raise ValueError("Received unlabeled mesh batch during training; cannot compute PLAID loss.")
+            del trainer
+            field_dim = len(metadata.get("target_fields", []))
+            scalar_dim = len(metadata.get("target_scalar_fields", []))
+            lbda = float(metadata.get("plaid_loss_lbda", 1.0 if scalar_dim == 0 else 0.5))
+            loss, _field_mse, _scalar_mse = mesh_batch_plaid_scaled_mse(
+                yh,
+                y,
+                batch,
+                batch_index=batch_index,
+                num_graphs=num_graphs,
+                field_dim=field_dim,
+                scalar_dim=scalar_dim,
+                lbda=lbda,
+            )
+            return loss
+
+        trainer.batch_lossfun = batch_lossfun
+
+    elif lpbf_graph_cache:
+        def batch_lossfun(trainer, model, batch):
+            yh, y, batch_index, num_graphs = ginot_model_forward(cfg, model, batch)
+            y_normalizer = metadata['y_normalizer'].to(y.device)
+            return lpbf_warped_rel_l2(
+                yh,
+                y,
+                y_normalizer,
+                batch_index=batch_index,
+                num_graphs=num_graphs,
+            )
+
+        trainer.batch_lossfun = batch_lossfun
+
+    elif ginot_pipeline:
+        def batch_lossfun(trainer, model, batch):
+            yh, y, batch_index, num_graphs = ginot_model_forward(cfg, model, batch)
+            y_normalizer = metadata['y_normalizer'].to(y.device)
+            yh = ginot_postprocess_displacement(yh, batch, y_normalizer=y_normalizer)
+            loss_spec = LossSpec(mask="free_mask" if batch.get("flat_free_mask") is not None else None)
+            masks = {"free_mask": batch["flat_free_mask"]} if loss_spec.mask else None
+            return compute_packed_loss(
+                yh,
+                y,
+                y_normalizer,
+                loss_spec,
+                batch_index=batch_index,
+                num_graphs=num_graphs,
+                masks=masks,
+            )
+
+        trainer.batch_lossfun = batch_lossfun
+
+    elif dataset in ['darcy']:
 
         r = 5
         h = int(((421 - 1) / r) + 1)
@@ -976,53 +820,139 @@ def main(cfg, device):
 
         trainer.batch_lossfun = batch_lossfun
 
-    elif cfg.dataset in ['lpbf']:
-
-        lf = pdebench.RelL2Loss()
-        def lossfun(yh, y):
-            y_normalizer = metadata['y_normalizer'].to(y.device)
-            yh = y_normalizer.decode(yh)
-            y  = y_normalizer.decode(y)
-            return lf(yh, y)
+    elif dataset in LPBF_DATASETS:
 
         def batch_lossfun(trainer, model, batch):
-            x  = batch.x.unsqueeze(0)
-            y  = batch.y.unsqueeze(0)
-            yh = model(x)
-            return lossfun(yh, y)
+            return lpbf_flare_batch_loss(
+                model,
+                batch,
+                metadata["y_normalizer"],
+            )
 
         trainer.batch_lossfun = batch_lossfun
 
-    elif cfg.dataset in ['airfoil_dynamic', 'cylinder_flow']:
+    elif dataset in ['navier_stokes']:
 
-        import am
+        lf = pdebench.RelL2Loss()
 
-        if GLOBAL_RANK == 0:
-            print(f"Using masked loss for timeseries datasets {cfg.dataset}")
-        batch_lossfun = am.MaskedLoss(mask=True)
+        def batch_lossfun(trainer, model, batch):
+            pos, history, target = batch
+            _, step_loss, _ = pdebench.rollout_navier_stokes(
+                model,
+                pos,
+                history,
+                target,
+                lossfun=lf,
+                teacher_forcing=True,
+            )
+            return step_loss
+
         trainer.batch_lossfun = batch_lossfun
+
+    elif dataset in ['plasticity']:
+
+        lf = pdebench.RelL2Loss()
+
+        def batch_lossfun(trainer, model, batch):
+            pos, time_grid, features, target = batch
+            _, step_loss, _ = pdebench.rollout_plasticity(
+                model,
+                pos,
+                time_grid,
+                features,
+                target,
+                lossfun=lf,
+            )
+            return step_loss
+
+        trainer.batch_lossfun = batch_lossfun
+
+        def plasticity_train_step(batch):
+            if trainer.grad_accumulation_steps != 1:
+                raise NotImplementedError("Plasticity upstream training parity requires grad_accumulation_steps == 1.")
+
+            if trainer.is_cuda:
+                torch.cuda.reset_peak_memory_stats()
+
+            batch_start_time = time.time()
+            trainer.model.train()
+
+            batch = trainer.move_to_device(batch)
+            batch = trainer.apply_preprocessor(batch, split='train')
+
+            pos, time_grid, features, target = batch
+            bsz = pos.shape[0]
+            num_steps = target.shape[-1]
+
+            trainer.opt.zero_grad()
+
+            model_eval_start = time.time()
+            step_loss_total = 0.0
+            grad_norm = float('nan')
+
+            for t in range(num_steps):
+                current_target = target[..., t:t + 1]
+                current_time = time_grid[:, t:t + 1].reshape(bsz, 1)
+
+                with trainer.auto_cast:
+                    pred = trainer.model(pos, features, current_time)
+                    loss = lf(pred.reshape(bsz, -1), current_target.reshape(bsz, -1))
+
+                step_loss_total += loss.item()
+                trainer.grad_scaler.scale(loss).backward()
+                trainer.trigger_callbacks("batch_post_grad")
+                trainer.grad_scaler.unscale_(trainer.opt)
+                grad_norm = torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), trainer.clip_grad_norm).item()
+                trainer.grad_scaler.step(trainer.opt)
+                trainer.grad_scaler.update()
+                trainer.opt.zero_grad()
+
+                if not trainer.update_schedule_every_epoch:
+                    trainer.schedule.step()
+
+                if trainer.use_ema:
+                    trainer.ema.update(trainer.model)
+
+            model_eval_end = time.time()
+            trainer.time_model_eval_per_step.append(model_eval_end - model_eval_start)
+
+            trainer.train_loss_per_batch.append(step_loss_total)
+            trainer.grad_norm_per_step.append(grad_norm)
+            for (i, lr) in enumerate(trainer.schedule.get_last_lr()):
+                trainer.learning_rates_per_step[i].append(lr)
+
+            trainer.time_per_step.append(time.time() - batch_start_time)
+
+            if trainer.is_cuda:
+                trainer.record_cuda_memory()
+
+            return torch.tensor(step_loss_total, device=trainer.device)
+
+        trainer.train_step = plasticity_train_step
 
     #-------------#
     # load snapshot
     #-------------#
-    
-    if cfg.restart:
+
+    if run_cfg.restart:
         callback.load_latest_checkpoint(trainer)
-    if cfg.load_weights_path is not None:
-        trainer.load_weights(cfg.load_weights_path)
-    
+    if run_cfg.load_weights_path is not None:
+        trainer.load_weights(run_cfg.load_weights_path)
+
     #=================#
     # TRAIN
     #=================#
 
-    if cfg.train and (cfg.epochs > 0 or cfg.steps > 0):
+    if run_cfg.train and (training_cfg.epochs > 0 or training_cfg.steps > 0):
+        timer.mark("train_start")
         trainer.train()
+        timer.mark("train_done")
 
     #=================#
     # ANALYSIS
     #=================#
 
-    if cfg.evaluate:
+    if run_cfg.evaluate:
         if device != 'cpu' and device != torch.device('cpu'):
             torch.cuda.empty_cache()
         trainer.make_dataloader()
@@ -1030,208 +960,126 @@ def main(cfg, device):
         trainer.statistics()
         callback(trainer, final=True)
 
+    timer.mark("main_exit")
     return
-
-#======================================================================#
-@dataclass
-class Config:
-    '''
-    Benchmarks transformer models on PDE datasets
-
-    For training, run 
-
-        python -m pdebench --train true ... <CONFIG>
-
-    and the result will be saved to out/pdebench/<exp_name>/ckpt<01, 02, ...>.
-
-    For evaluation, run
-
-        python -m pdebench --evaluate true --exp_name <exp_name>
-
-    and the model in the latest checkpoint out/pdebench/<exp_name>/ckptXX will be evaluated.
-
-    For restarting from checkpoint, run
-
-        python -m pdebench --restart true --exp_name <exp_name>
-
-    and training will resume from the latest checkpoint in out/pdebench/<exp_name>/ckptXX.
-
-    For loading weights, run
-
-        python -m pdebench --load_weights_path <path_to_weights> ... <CONFIG>
-
-    and the weights will be loaded from the specified path.
-    '''
-
-    # case configuration
-    train: bool = False
-    evaluate: bool = False
-    restart: bool = False
-    load_weights_path: str = None
-
-    exp_name: str = 'exp'
-    seed: int = 0
-
-    # dataset
-    dataset: str = None
-    num_workers: int = 0
-    prefetch_factor: int = None
-
-    # training arguments
-    epochs: int = 100
-    steps: int = 0
-    batch_size: int = 1
-    # Optimizer
-    optimizer: str = 'adamw' # adamw, lion, muon
-    learning_rate: Union[float, List[float]] = 1e-3
-    weight_decay: Union[float, List[float]] = 0e-0
-    opt_beta1: Union[float, List[float]] = 0.9
-    opt_beta2: Union[float, List[float]] = 0.999
-    opt_eps: Union[float, List[float]] = 1e-8
-    # Scheduler
-    schedule: str = 'OneCycleLR'
-    # OneCycleLR
-    one_cycle_pct_start:float = 0.10
-    one_cycle_div_factor: float = 1e4
-    one_cycle_final_div_factor: float = 1e4
-    one_cycle_three_phase: bool = False
-    one_cycle_cycle_momentum: bool = True
-    one_cycle_base_momentum: float = 0.85
-    one_cycle_max_momentum: float = 0.95
-    one_cycle_anneal_strategy: str = 'cos'
-    one_cycle_override_min_lr: float = None
-
-    clip_grad_norm: float = 1.0
-    grad_accumulation_steps: int = 1
-    mixed_precision: bool = False
-    compile_model: bool = True
-    static_graph: bool = True
-
-    ema: bool = True
-    ema_decay: float = 0.999
-
-    # timing run
-    timing_only: bool = False
-
-    # model
-    model_type: str = 'flare' # transolver(++), lno, transformer, gnot, perceiverio, flare, flare_ablations, lamo
-    use_defaults: bool = False # use hardcoded default hyperparameters
-
-    # Used in all models
-    num_blocks: int = 8
-    channel_dim: int = 64
-    num_heads: int = 8
-    act: str = None
-    rmsnorm: bool = False
-    # Transformer
-    mlp_ratio: float = 4.0
-    # Linformer
-    linformer_k: int = 256
-    # Linear
-    kernel: str = 'identity' # elu, silu, silunorm, identity
-    qk_dim_ratio: float = 1.0
-    norm_q: bool = True
-    norm_k: bool = True
-    # Triple
-    use_triton: bool = False
-    # Multilinear
-    num_states: int = 2
-    num_layers_kv_proj: int = 3
-    kv_proj_mlp_ratio: float = 1.0
-    # FLARE
-    attn_scale: str = 'one' # 'one': 1.0, 'sqrt': 1/sqrt(D)
-    num_latents: int = 64
-    num_layers_k_proj: int = 3
-    num_layers_v_proj: int = 3
-    k_proj_mlp_ratio: float = 1.0
-    v_proj_mlp_ratio: float = 1.0
-    num_layers_ffn: int = 3
-    ffn_mlp_ratio: float = 1.0
-    qk_norm: bool = False
-    # Loopy
-    num_passes: int = 1
-    # Unloopy
-    shared_ffn: bool = False
-    shared_att: bool = False
-    gating: bool = False
-    num_layers_gating_proj: int = 3
-    gating_proj_mlp_ratio: float = 1.0
-    # Input/output projection
-    num_layers_in_out_proj: int = 2
-    in_out_proj_ratio: float = 1.0
-    out_proj_norm: bool = True
-    # Transolver
-    conv2d: bool = False
-    unified_pos: bool = False
-    num_slices: int = 64
-    # LNO
-    num_modes: int = 256
-    # GNOT
-    num_experts: int = 3
-    # Perceiver
-    pcvr_cross_attn: bool = False
 
 #======================================================================#
 if __name__ == "__main__":
 
+    argv = list(sys.argv)
     DISTRIBUTED = mlutils.is_torchrun()
     GLOBAL_RANK = int(os.environ['RANK']) if DISTRIBUTED else 0
     WORLD_SIZE = int(os.environ['WORLD_SIZE']) if DISTRIBUTED else 1
-    device = mlutils.select_device()
+    _forced_device = os.environ.get('PDEBENCH_DEVICE')
+    if _forced_device is not None:
+        device = torch.device(_forced_device)
+    else:
+        device = mlutils.select_device()
+
+    run_timer = mlutils.RunTimer(rank=GLOBAL_RANK, log_rank=0)
+    run_timer.mark("process_start")
 
     #===============#
-    cfg = CLI(Config, as_positional=False)
+    parser = ArgumentParser()
+    parser.add_class_arguments(Config, nested_key=None)
+    parsed = parser.parse_args()
+    cfg = Config(**parsed.as_dict())
     #===============#
 
-    if (cfg.train + cfg.evaluate + cfg.restart) != 1:
-        msg = f"Invalid mode selection. Select one of train (got {cfg.train}), evaluate (got {cfg.evaluate}), restart (got {cfg.restart})."
+    if (cfg.run.train + cfg.run.evaluate + cfg.run.restart) != 1:
+        msg = (
+            "Invalid mode selection. Select one of "
+            f"train (got {cfg.run.train}), evaluate (got {cfg.run.evaluate}), restart (got {cfg.run.restart})."
+        )
         raise ValueError(msg)
 
-    #===============#
-    mlutils.set_seed(cfg.seed)
-    #===============#
+    cli_cfg_dict = cfg.to_dict()
 
-    if cfg.train:
-        cfg.exp_name = mlutils.get_next_exp_name(CASEDIR, cfg.exp_name)
-        case_dir = os.path.join(CASEDIR, cfg.exp_name)
+    case_dir: str | None = None
+    log_path: str | None = None
+
+    if cfg.run.train:
+        cfg.run.exp_name = mlutils.get_next_exp_name(CASEDIR, cfg.run.exp_name)
+        case_dir = os.path.join(CASEDIR, cfg.run.exp_name)
 
         if DISTRIBUTED:
             torch.distributed.barrier()
 
         if GLOBAL_RANK == 0:
-            os.makedirs(case_dir)
+            os.makedirs(case_dir, exist_ok=True)
+            log_path = os.path.join(case_dir, "log.txt")
+            mlutils.setup_run_log(log_path, rank=GLOBAL_RANK)
+            mlutils.log_run_banner(
+                argv=argv,
+                cfg_dict=cli_cfg_dict,
+                case_dir=case_dir,
+                log_path=log_path,
+            )
             config_file = os.path.join(case_dir, 'config.yaml')
             print(f'Saving config to {config_file}')
             with open(config_file, 'w') as f:
-                yaml.safe_dump(vars(cfg), f)
+                yaml.safe_dump(cfg.to_dict(), f)
+            mlutils.log_config_trace(argv=argv, cfg_dict=cfg.to_dict(), title="resolved config (train)")
 
     # load config from experiment directory
-    if cfg.evaluate or cfg.restart:
-        case_dir = os.path.join(CASEDIR, cfg.exp_name)
+    if cfg.run.evaluate or cfg.run.restart:
+        case_dir = os.path.join(CASEDIR, cfg.run.exp_name)
         assert os.path.exists(case_dir), f"Experiment directory {case_dir} does not exist."
         config_file = os.path.join(case_dir, 'config.yaml')
 
         # save original config
         _cfg = cfg
 
-        # load config from experiment directory
         if GLOBAL_RANK == 0:
+            log_path = os.path.join(case_dir, "log.txt")
+            mlutils.setup_run_log(log_path, rank=GLOBAL_RANK)
+            mlutils.log_run_banner(
+                argv=argv,
+                cfg_dict=cli_cfg_dict,
+                case_dir=case_dir,
+                log_path=log_path,
+            )
             print(f'Loading config from {config_file}')
+
         with open(config_file, 'r') as f:
             cfg = yaml.safe_load(f)
-        cfg = Config(**{k: v for k, v in cfg.items() if k in Config.__annotations__})
+        cfg = Config(**cfg)
 
-        if _cfg.evaluate:
-            cfg.evaluate = True
-            cfg.train = False
-        elif _cfg.restart:
-            cfg.restart = True
-            cfg.train = True
+        if _cfg.run.evaluate:
+            cfg.run.evaluate = True
+            cfg.run.train = False
+        elif _cfg.run.restart:
+            cfg.run.restart = True
+            cfg.run.train = True
+
+        if GLOBAL_RANK == 0:
+            mlutils.log_config_trace(argv=argv, cfg_dict=cfg.to_dict(), title="resolved config (evaluate/restart)")
+
+    # after evaluate/restart config reload
+    #===============#
+    runtime = mlutils.configure_runtime(
+        cfg.run.seed,
+        mixed_precision=bool(cfg.training.mixed_precision),
+        deterministic=bool(cfg.run.deterministic),
+        compile_model=bool(cfg.training.compile_model),
+    )
+    if GLOBAL_RANK == 0:
+        print(
+            "runtime_profile={profile} seed={seed} tf32={tf32} "
+            "cudnn.benchmark={cudnn_benchmark} cudnn.deterministic={cudnn_deterministic} "
+            "deterministic_algorithms={deterministic_algorithms}".format(**runtime)
+        )
+    #===============#
 
     if DISTRIBUTED:
         torch.distributed.barrier()
 
-    main(cfg, device)
+    try:
+        main(cfg, device, run_timer=run_timer)
+        run_timer.mark("process_done")
+        run_timer.print_summary()
+    finally:
+        mlutils.close_run_log()
 
     #===============#
     mlutils.dist_finalize()

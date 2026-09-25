@@ -42,6 +42,12 @@ def make_model(cfg, metadata, GLOBAL_RANK=0):
             attn_drop=cfg.attn_drop,
             proj_drop=cfg.proj_drop,
         )
+    elif cfg.model_type == 'transolver':
+        model_name = 'Transolver'
+        backend_kwargs = dict(
+            mlp_ratio=cfg.mlp_ratio,
+            num_slices=cfg.num_slices,
+        )
     elif cfg.model_type == 'flare':
         model_name = 'FLARE'
         kv_proj_hidden_dim = int(cfg.channel_dim * cfg.kv_proj_mlp_ratio)
@@ -56,10 +62,25 @@ def make_model(cfg, metadata, GLOBAL_RANK=0):
         backend_kwargs = dict(
             num_latents=cfg.num_latents,
             attn_scale=cfg.attn_scale,
+            q_norm=cfg.q_norm,
+            k_norm=cfg.k_norm,
             num_layers_kv_proj=cfg.num_layers_kv_proj,
             num_layers_ffn=cfg.num_layers_ffn,
             kv_proj_hidden_dim=kv_proj_hidden_dim,
             ffn_hidden_dim=ffn_hidden_dim,
+            attn_drop=cfg.attn_drop,
+            proj_drop=cfg.proj_drop,
+        )
+    elif cfg.model_type == 'flarepp':
+        model_name = 'FLAREPP'
+        backend_kwargs = dict(
+            num_latents=cfg.num_latents,
+            k_norm=cfg.k_norm,
+            share_k0_v0=cfg.share_k0_v0,
+            q_fixed_norm=cfg.q_fixed_norm,
+            gate_logit_init=cfg.gate_logit_init,
+            num_layers_ffn=cfg.num_layers_ffn,
+            ffn_hidden_dim=int(cfg.channel_dim * cfg.ffn_mlp_ratio),
             attn_drop=cfg.attn_drop,
             proj_drop=cfg.proj_drop,
         )
@@ -68,6 +89,7 @@ def make_model(cfg, metadata, GLOBAL_RANK=0):
         backend_kwargs = dict(
             seq_len=max_length,
             k=cfg.linformer_k,
+            share_kv=cfg.linformer_share_kv,
             mlp_ratio=cfg.mlp_ratio,
             attn_drop=cfg.attn_drop,
             proj_drop=cfg.proj_drop,
@@ -76,8 +98,8 @@ def make_model(cfg, metadata, GLOBAL_RANK=0):
         model_name = 'LinearAttention'
         backend_kwargs = dict(
             kernel=cfg.kernel,
-            norm_q=cfg.norm_q,
-            norm_k=cfg.norm_k,
+            q_norm=cfg.q_norm,
+            k_norm=cfg.k_norm,
             mlp_ratio=cfg.mlp_ratio,
             attn_drop=cfg.attn_drop,
             proj_drop=cfg.proj_drop,
@@ -89,11 +111,22 @@ def make_model(cfg, metadata, GLOBAL_RANK=0):
             num_layers_kv_proj=cfg.num_layers_kv_proj,
             kv_proj_mlp_ratio=cfg.kv_proj_mlp_ratio,
             kernel=cfg.kernel,
-            norm_q=cfg.norm_q,
-            norm_k=cfg.norm_k,
+            q_norm=cfg.q_norm,
+            k_norm=cfg.k_norm,
             qk_dim_ratio=cfg.qk_dim_ratio,
             num_layers_ffn=cfg.num_layers_ffn,
             ffn_mlp_ratio=cfg.ffn_mlp_ratio,
+            attn_drop=cfg.attn_drop,
+            proj_drop=cfg.proj_drop,
+        )
+    elif cfg.model_type == 'normattention':
+        model_name = 'NormAttention'
+        backend_kwargs = dict(
+            num_layers_kv_proj=cfg.num_layers_kv_proj,
+            kv_proj_mlp_ratio=cfg.kv_proj_mlp_ratio,
+            num_layers_ffn=cfg.num_layers_ffn,
+            ffn_mlp_ratio=cfg.ffn_mlp_ratio,
+            qk_dim_ratio=cfg.qk_dim_ratio,
             attn_drop=cfg.attn_drop,
             proj_drop=cfg.proj_drop,
         )
@@ -103,8 +136,8 @@ def make_model(cfg, metadata, GLOBAL_RANK=0):
             num_layers_kv_proj=cfg.num_layers_kv_proj,
             kv_proj_mlp_ratio=cfg.kv_proj_mlp_ratio,
             kernel=cfg.kernel,
-            norm_q=cfg.norm_q,
-            norm_k=cfg.norm_k,
+            q_norm=cfg.q_norm,
+            k_norm=cfg.k_norm,
             qk_dim_ratio=cfg.qk_dim_ratio,
             use_triton=cfg.use_triton,
             num_layers_ffn=cfg.num_layers_ffn,
@@ -124,11 +157,35 @@ def make_model(cfg, metadata, GLOBAL_RANK=0):
         model_name = 'PerformerAttention'
         backend_kwargs = dict(
             nb_features=cfg.performer_nb_features,
+            feature_map=cfg.performer_feature_map,
             redraw_interval=cfg.performer_redraw_interval,
             normalize_inputs=cfg.performer_normalize_inputs,
             mlp_ratio=cfg.mlp_ratio,
             attn_drop=cfg.attn_drop,
             proj_drop=cfg.proj_drop,
+        )
+    elif cfg.model_type == 'cosformer':
+        model_name = 'CosformerAttention'
+        backend_kwargs = dict(
+            mlp_ratio=cfg.mlp_ratio,
+            attn_drop=cfg.attn_drop,
+            proj_drop=cfg.proj_drop,
+        )
+    elif cfg.model_type == 'funnel_hf':
+        model_name = 'FunnelTransformer(HF)'
+        backend_kwargs = dict(
+            mlp_ratio=cfg.mlp_ratio,
+            funnel_block_sizes=cfg.funnel_block_sizes,
+        )
+    elif cfg.model_type == 'reformer_hf':
+        model_name = 'Reformer(HF)'
+        backend_kwargs = dict(
+            mlp_ratio=cfg.mlp_ratio,
+            reformer_attn_layers=cfg.reformer_attn_layers,
+            reformer_num_hashes=cfg.reformer_num_hashes,
+            reformer_local_chunk_length=cfg.reformer_local_chunk_length,
+            reformer_lsh_chunk_length=cfg.reformer_lsh_chunk_length,
+            reformer_axial_pos_shape=cfg.reformer_axial_pos_shape,
         )
     else:
         model_name = None
@@ -160,6 +217,10 @@ def make_model(cfg, metadata, GLOBAL_RANK=0):
         )
         
     if cfg.trm:
+        if cfg.model_type == 'transolver':
+            raise NotImplementedError("Transolver is not supported with TRM; use the standard ModelWrapper path.")
+        if cfg.model_type in ['funnel_hf', 'reformer_hf']:
+            raise NotImplementedError(f"TRM is not supported for external backend {cfg.model_type}.")
         model = lra.TRMWrapper(
             task=cfg.task,
             vocab_size=vocab_size,
@@ -186,26 +247,50 @@ def make_model(cfg, metadata, GLOBAL_RANK=0):
             **backend_kwargs,
         )
     else:
-        model = lra.ModelWrapper(
-            task=cfg.task,
-            vocab_size=vocab_size,
-            num_labels=num_labels,
-            max_length=max_length,
-            pool=pool,
-            pad_id=pad_id,
-            ###
-            emb_drop=cfg.emb_drop,
-            cls_drop=cfg.cls_drop,
-            pos_embed=cfg.pos_embed,
-            ###
-            num_blocks=cfg.num_blocks,
-            backend=cfg.model_type,
-            channel_dim=cfg.channel_dim,
-            num_heads=cfg.num_heads,
-            act=cfg.act,
-            rmsnorm=cfg.rmsnorm,
-            **backend_kwargs,
-        )
+        if cfg.model_type in ['funnel_hf', 'reformer_hf']:
+            model = lra.ExternalModelWrapper(
+                task=cfg.task,
+                vocab_size=vocab_size,
+                num_labels=num_labels,
+                max_length=max_length,
+                pool=pool,
+                pad_id=pad_id,
+                ###
+                emb_drop=cfg.emb_drop,
+                cls_drop=cfg.cls_drop,
+                attn_drop=cfg.attn_drop,
+                proj_drop=cfg.proj_drop,
+                pos_embed=cfg.pos_embed,
+                ###
+                num_blocks=cfg.num_blocks,
+                backend=cfg.model_type,
+                channel_dim=cfg.channel_dim,
+                num_heads=cfg.num_heads,
+                act=cfg.act,
+                rmsnorm=cfg.rmsnorm,
+                **backend_kwargs,
+            )
+        else:
+            model = lra.ModelWrapper(
+                task=cfg.task,
+                vocab_size=vocab_size,
+                num_labels=num_labels,
+                max_length=max_length,
+                pool=pool,
+                pad_id=pad_id,
+                ###
+                emb_drop=cfg.emb_drop,
+                cls_drop=cfg.cls_drop,
+                pos_embed=cfg.pos_embed,
+                ###
+                num_blocks=cfg.num_blocks,
+                backend=cfg.model_type,
+                channel_dim=cfg.channel_dim,
+                num_heads=cfg.num_heads,
+                act=cfg.act,
+                rmsnorm=cfg.rmsnorm,
+                **backend_kwargs,
+            )
         
     return model
 
@@ -450,7 +535,7 @@ class Config:
     channel_dim: int = 128 # 256, 512, 768
     num_heads: int = 8 # 8, 12
     act: str = None
-    rmsnorm: bool = False
+    rmsnorm: bool = True
     pool: str = 'mean' # 'mean', 'max', 'cls'
     # Embedding
     emb_drop: float = 0.0
@@ -462,28 +547,44 @@ class Config:
 
     # Transformer
     mlp_ratio: float = 4.0
+    # Transolver
+    num_slices: int = 64
     # Linformer
     linformer_k: int = 256
+    linformer_share_kv: bool = False
     # Performer
     performer_nb_features: int = 256
+    performer_feature_map: str = 'favor_plus'
     performer_redraw_interval: int = 0
     performer_normalize_inputs: bool = True
+    # External baselines
+    funnel_block_sizes: Optional[List[int]] = None
+    reformer_attn_layers: Optional[List[str]] = None
+    reformer_num_hashes: int = 1
+    reformer_local_chunk_length: Optional[int] = None
+    reformer_lsh_chunk_length: Optional[int] = None
+    reformer_axial_pos_shape: Optional[List[int]] = None
     # Linear
     kernel: str = 'identity' # elu, silu, silunorm, identity
     qk_dim_ratio: float = 1.0
-    norm_q: bool = True
-    norm_k: bool = True
+    q_norm: bool = True
+    k_norm: bool = True
     # Triple
     use_triton: bool = False
     # Multilinear
     num_states: int = 2
+    # FLARE / FLAREPP
+    num_latents: int = 128
+    num_layers_ffn: int = 3
+    ffn_mlp_ratio: float = 1.0
     # FLARE
     attn_scale: str = 'one' # 'one': 1.0, 'sqrt': 1/sqrt(D)
-    num_latents: int = 128
     num_layers_kv_proj: int = 3
-    num_layers_ffn: int = 3
     kv_proj_mlp_ratio: float = 1.0
-    ffn_mlp_ratio: float = 1.0
+    # FLAREPP
+    share_k0_v0: bool = True
+    q_fixed_norm: bool = True
+    gate_logit_init: float = 0.25
     # ThirdOrderAttention
     third_order_method: str = 'third_order' # 'strassen', 'third_order'
 

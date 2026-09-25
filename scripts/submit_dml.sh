@@ -38,8 +38,7 @@
 # Setup
 #============================#
 echo "Setting up environment"
-source ~/.bash_profile
-cd /project/community/vedantpu/FLARE.py
+cd /project/community/$(whoami)/FLARE-dev.py
 
 #============================#
 # Run

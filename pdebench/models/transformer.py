@@ -1,10 +1,53 @@
 #
+from dataclasses import dataclass
+from typing import Optional
+
 import torch
 from torch import nn
 
 __all__ = [
     "TransformerWrapper",
 ]
+
+@dataclass
+class TransformerConfig:
+    model: str = "transformer"
+    channel_dim: int = 64
+    num_blocks: int = 8
+    num_heads: int = 8
+    act: Optional[str] = None
+    rmsnorm: bool = False
+    mlp_ratio: float = 4.0
+    out_proj_norm: bool = True
+    num_layers_in_out_proj: int = 2
+
+@dataclass
+class LinformerConfig:
+    model: str = "linformer"
+    channel_dim: int = 64
+    num_blocks: int = 8
+    num_heads: int = 8
+    act: Optional[str] = None
+    rmsnorm: bool = False
+    mlp_ratio: float = 4.0
+    out_proj_norm: bool = True
+    num_layers_in_out_proj: int = 2
+    linformer_k: int = 256
+
+@dataclass
+class LinearConfig:
+    model: str = "linear"
+    channel_dim: int = 64
+    num_blocks: int = 8
+    num_heads: int = 8
+    act: Optional[str] = None
+    rmsnorm: bool = False
+    mlp_ratio: float = 4.0
+    out_proj_norm: bool = True
+    num_layers_in_out_proj: int = 2
+    kernel: str = "identity"
+    norm_q: bool = True
+    norm_k: bool = True
 
 from .flare import ResidualMLP
 from lra.models.backends import MODEL_TYPES
@@ -13,23 +56,28 @@ from lra.models.backends import MODEL_TYPES
 # MODEL
 #======================================================================#
 class TransformerWrapper(nn.Module):
-    def __init__(self,
-        in_dim: int,
-        out_dim: int,
-        channel_dim: int = 64,
-        num_blocks: int = 8,
-        num_heads: int = None,
-        act: str = None,
-        rmsnorm: bool = False,
-        ###
-        out_proj_norm: bool = True,
-        num_layers_in_out_proj: int = 2,
-        ###
-        backend: str = 'transformer',
-        **backend_kwargs,
-    ):
+    def __init__(self, config: TransformerConfig | LinformerConfig | LinearConfig, metadata=None):
         super().__init__()
-        
+        metadata = {} if metadata is None else metadata
+        in_dim = metadata["c_in"]
+        out_dim = metadata["c_out"]
+        if isinstance(config, LinformerConfig):
+            backend = "linformer"
+            backend_kwargs = dict(mlp_ratio=config.mlp_ratio, seq_len=metadata["max_length"], k=config.linformer_k)
+        elif isinstance(config, LinearConfig):
+            backend = "linear"
+            backend_kwargs = dict(mlp_ratio=config.mlp_ratio, kernel=config.kernel, norm_q=config.norm_q, norm_k=config.norm_k)
+        else:
+            backend = "transformer"
+            backend_kwargs = dict(mlp_ratio=config.mlp_ratio)
+
+        channel_dim = config.channel_dim
+        num_blocks = config.num_blocks
+        num_heads = config.num_heads
+        act = config.act
+        rmsnorm = config.rmsnorm
+        out_proj_norm = config.out_proj_norm
+        num_layers_in_out_proj = config.num_layers_in_out_proj
         in_out_act = act if act in ['gelu', 'silu'] else 'gelu'
 
         self.in_proj = ResidualMLP(
@@ -89,15 +137,18 @@ class TransformerWrapper(nn.Module):
             if hasattr(m, 'bias') and m.bias is not None:
                 nn.init.constant_(m.bias, 0.)
 
-    def forward(self, x):
+    def forward(self, x, mask=None, **kwargs):
         # x: [B, N, C]
+        if mask is not None:
+            x = x * mask.unsqueeze(-1).to(dtype=x.dtype)
 
         x = self.in_proj(x)
         for block in self.blocks:
             x = block(x)
         x = self.out_proj(x)
+        if mask is not None:
+            x = x * mask.unsqueeze(-1).to(dtype=x.dtype)
 
         return x
 
 #======================================================================#
-#

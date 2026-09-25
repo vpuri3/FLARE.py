@@ -4,10 +4,23 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from einops import rearrange
+from dataclasses import dataclass
+from typing import Optional
 
 __all__ = [
     "PerceiverIO",
 ]
+
+@dataclass
+class PerceiverIOConfig:
+    model: str = "perceiverio"
+    channel_dim: int = 64
+    num_blocks: int = 8
+    num_heads: int = 8
+    mlp_ratio: float = 4.0
+    act: Optional[str] = None
+    num_latents: int = 64
+    pcvr_cross_attn: bool = False
 
 # local
 from .flare import ResidualMLP
@@ -179,18 +192,18 @@ class PerceiverDecoder(nn.Module):
 # MODEL
 #======================================================================#
 class PerceiverIO(nn.Module):
-    def __init__(self,
-        in_dim: int,
-        out_dim: int,
-        channel_dim: int = 64,
-        num_blocks: int = 8,
-        num_heads: int = 8,
-        num_latents: int = 128,
-        mlp_ratio: float = 4.0,
-        act: str = None,
-        cross_attn: bool = False,
-    ):
+    def __init__(self, config: PerceiverIOConfig, metadata=None):
         super().__init__()
+        metadata = {} if metadata is None else metadata
+        in_dim = metadata["c_in"]
+        out_dim = metadata["c_out"]
+        channel_dim = config.channel_dim
+        num_blocks = config.num_blocks
+        num_heads = config.num_heads
+        num_latents = config.num_latents
+        mlp_ratio = config.mlp_ratio
+        act = config.act
+        cross_attn = config.pcvr_cross_attn
 
         self.in_proj = ResidualMLP(
             in_dim=in_dim,

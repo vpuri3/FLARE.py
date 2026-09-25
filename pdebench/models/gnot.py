@@ -6,9 +6,23 @@ import torch.nn as nn
 from einops import repeat, rearrange
 from torch.nn import functional as F
 
+from dataclasses import dataclass
+from typing import Optional
+
 __all__ = [
     "GNOT",
+    "GNOTConfig",
 ]
+
+@dataclass
+class GNOTConfig:
+    model: str = "gnot"
+    num_blocks: int = 8
+    channel_dim: int = 64
+    num_heads: int = 8
+    num_experts: int = 3
+    mlp_ratio: float = 4.0
+
 
 #======================================================================#
 # https://github.com/thuml/Neural-Solver-Library/models/GNOT.py
@@ -104,7 +118,7 @@ class LinearAttention(nn.Module):
         return y
 
 #======================================================================#
-def unified_pos_embedding(shapelist, ref, batchsize=1, device='cuda'):
+def unified_pos_embedding(shapelist, ref, batchsize=1, device='cpu'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') if device is None else device
     if len(shapelist) == 1:
         size_x = shapelist[0]
@@ -240,64 +254,58 @@ class GNOT_block(nn.Module):
 
 #======================================================================#
 class GNOT(nn.Module):
-    def __init__(
-        self,
-        n_experts: int = 3,
-        n_heads: int = 8,
-        n_hidden: int = 128,
-        n_layers: int = 4,
-        mlp_ratio: int = 4,
-        unified_pos: bool = False,
-        geotype: str = 'unstructured',
-        shapelist: list = None,
-        ref: int = None,
-        fun_dim: int = 1,
-        space_dim: int = 2,
-        time_input: bool = False,
-        dropout: float = 0.0,
-        act: str = 'gelu',
-        out_dim: int = 1,
-    ):
+    def __init__(self, config: GNOTConfig, metadata=None):
         super(GNOT, self).__init__()
-        self.__name__ = 'GNOT'
-        self.n_experts = n_experts
-        self.n_heads = n_heads
-        self.n_hidden = n_hidden
-        self.n_layers = n_layers
-        self.mlp_ratio = mlp_ratio
-        self.act = act
-        self.space_dim = space_dim
-        self.unified_pos = unified_pos
+        metadata = {} if metadata is None else dict(metadata)
+        dataset = metadata.get("dataset")
+        self.n_experts = int(getattr(config, "num_experts", 3))
+        self.n_heads = int(config.num_heads)
+        self.n_hidden = int(config.channel_dim)
+        self.n_layers = int(config.num_blocks)
+        self.mlp_ratio = float(config.mlp_ratio)
+        self.act = "gelu" if getattr(config, "act", None) is None else config.act
+        self.space_dim = int(metadata.get("space_dim", metadata.get("c_in", 2)))
+        self.unified_pos = bool(getattr(config, "unified_pos", False))
+        self.geotype = getattr(config, "geotype", "structured_2D" if dataset in {'darcy', 'airfoil_steady', 'pipe', 'navier_stokes', 'plasticity'} else "unstructured")
+        self.shapelist = getattr(config, "shapelist", None)
+        self.ref = int(getattr(config, "ref", 8))
+        fun_dim = int(metadata.get("fun_dim", 1))
+        out_dim = int(metadata.get("c_out", 1))
+        time_input = bool(getattr(config, "time_input", False))
+        dropout = float(getattr(config, "dropout", 0.0))
 
-        ## embedding
-        if unified_pos and geotype != 'unstructured':  # only for structured mesh
-            self.pos = unified_pos_embedding(shapelist, ref)
-            self.preprocess_x = MLP(ref ** len(shapelist), n_hidden * 2,
-                                    n_hidden, n_layers=0, res=False, act=act)
-            self.preprocess_z = MLP(fun_dim + ref ** len(shapelist), n_hidden * 2,
-                                    n_hidden, n_layers=0, res=False, act=act)
+        if self.unified_pos and self.geotype != 'unstructured':
+            if self.shapelist is None:
+                if "H" not in metadata or "W" not in metadata:
+                    raise ValueError("GNOT structured unified_pos requires H and W metadata.")
+                self.shapelist = [int(metadata["H"]), int(metadata["W"])]
+            self.pos = unified_pos_embedding(self.shapelist, self.ref)
+            self.preprocess_x = MLP(self.ref ** len(self.shapelist), self.n_hidden * 2, self.n_hidden,
+                                    n_layers=0, res=False, act=self.act)
+            self.preprocess_z = MLP(fun_dim + self.ref ** len(self.shapelist), self.n_hidden * 2, self.n_hidden,
+                                    n_layers=0, res=False, act=self.act)
         else:
-            self.preprocess_x = MLP(space_dim, n_hidden * 2, n_hidden,
-                                    n_layers=0, res=False, act=act)
-            self.preprocess_z = MLP(fun_dim + space_dim, n_hidden * 2, n_hidden,
-                                    n_layers=0, res=False, act=act)
+            self.preprocess_x = MLP(self.space_dim, self.n_hidden * 2, self.n_hidden,
+                                    n_layers=0, res=False, act=self.act)
+            self.preprocess_z = MLP(fun_dim + self.space_dim, self.n_hidden * 2, self.n_hidden,
+                                    n_layers=0, res=False, act=self.act)
         if time_input:
-            self.time_fc = nn.Sequential(nn.Linear(n_hidden, n_hidden), nn.SiLU(),
-                                         nn.Linear(n_hidden, n_hidden))
+            self.time_fc = nn.Sequential(nn.Linear(self.n_hidden, self.n_hidden), nn.SiLU(),
+                                         nn.Linear(self.n_hidden, self.n_hidden))
 
         ## models
-        self.blocks = nn.ModuleList([GNOT_block(num_heads=n_heads,
-                                                hidden_dim=n_hidden,
+        self.blocks = nn.ModuleList([GNOT_block(num_heads=self.n_heads,
+                                                hidden_dim=self.n_hidden,
                                                 dropout=dropout,
-                                                act=act,
-                                                mlp_ratio=mlp_ratio,
-                                                space_dim=space_dim,
-                                                n_experts=n_experts)
-                                     for _ in range(n_layers)])
-        self.placeholder = nn.Parameter((1 / (n_hidden)) * torch.rand(n_hidden, dtype=torch.float))
+                                                act=self.act,
+                                                mlp_ratio=self.mlp_ratio,
+                                                space_dim=self.space_dim,
+                                                n_experts=self.n_experts)
+                                     for _ in range(self.n_layers)])
+        self.placeholder = nn.Parameter((1 / (self.n_hidden)) * torch.rand(self.n_hidden, dtype=torch.float))
         # projectors
-        self.fc1 = nn.Linear(n_hidden, n_hidden * 2)
-        self.fc2 = nn.Linear(n_hidden * 2, out_dim)
+        self.fc1 = nn.Linear(self.n_hidden, self.n_hidden * 2)
+        self.fc2 = nn.Linear(self.n_hidden * 2, out_dim)
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -315,7 +323,7 @@ class GNOT(nn.Module):
     def forward(self, x, fx=None, T=None):
         pos = x
         if self.unified_pos:
-            x = self.pos.repeat(x.shape[0], 1, 1)
+            x = self.pos.to(device=x.device, dtype=x.dtype).repeat(x.shape[0], 1, 1)
         if fx is not None:
             fx = torch.cat((x, fx), -1)
             fx = self.preprocess_z(fx)

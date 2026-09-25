@@ -6,6 +6,9 @@ from torch.nn import functional as F
 from timm.layers import trunc_normal_
 from einops import rearrange, repeat
 
+from dataclasses import dataclass
+from typing import Optional
+
 import math
 import numpy as np
 
@@ -14,11 +17,42 @@ __all__ = [
     "LaMO_Structured_Mesh_2D",
 ]
 
+@dataclass
+class LaMOConfig:
+    """LaMO configuration.
+
+    ``conv2d`` is not read inside ``LaMO`` / ``LaMO_Structured_Mesh_2D``;
+    ``model_factory`` uses it only to dispatch the structured-mesh 2D variant.
+    """
+
+    model: str = "lamo"
+    num_blocks: int = 8
+    channel_dim: int = 64
+    num_heads: int = 8
+    mlp_ratio: float = 4.0
+    num_slices: int = 64
+    conv2d: bool = False
+    unified_pos: bool = False
+
+
 ACTIVATION = {'gelu': nn.GELU, 'tanh': nn.Tanh, 'sigmoid': nn.Sigmoid, 'relu': nn.ReLU, 'leaky_relu': nn.LeakyReLU(0.1),
               'softplus': nn.Softplus, 'ELU': nn.ELU, 'silu': nn.SiLU}
 
-from .mamba.mamba_2D_v1 import Mamba2
-from .mamba.mamba_2D_v2 import Hydra
+try:
+    from .mamba.mamba_2D_v1 import Mamba2
+    from .mamba.mamba_2D_v2 import Hydra
+except ModuleNotFoundError as exc:
+    _LAMO_MAMBA_IMPORT_ERROR = exc
+
+    class _MissingMambaModule:
+        def __init__(self, *args, **kwargs):
+            raise ModuleNotFoundError(
+                "LaMO is unavailable because optional dependencies are missing "
+                "(mamba-ssm/causal-conv1d)."
+            ) from _LAMO_MAMBA_IMPORT_ERROR
+
+    Mamba2 = _MissingMambaModule
+    Hydra = _MissingMambaModule
 
 #======================================================================#
 # Latent SSMs
@@ -270,24 +304,26 @@ class LaMOBlock(nn.Module):
             return fx
 
 class LaMO(nn.Module):
-    def __init__(self,
-                 space_dim=1,
-                 n_layers=5,
-                 n_hidden=256,
-                 dropout=0,
-                 n_head=8,
-                 act='gelu',
-                 mlp_ratio=1,
-                 fun_dim=1,
-                 out_dim=1,
-                 slice_num=32,
-                 ):
+    def __init__(self, config: LaMOConfig, metadata=None):
         super(LaMO, self).__init__()
+        metadata = {} if metadata is None else dict(metadata)
+        space_dim = int(metadata.get("space_dim", metadata.get("c_in", 1)))
+        fun_dim = int(metadata.get("fun_dim", 1))
+        out_dim = int(metadata.get("c_out", 1))
+        n_layers = int(config.num_blocks)
+        n_hidden = int(config.channel_dim)
+        dropout = float(getattr(config, "dropout", 0.0))
+        n_head = int(config.num_heads)
+        act = "gelu" if getattr(config, "act", None) is None else config.act
+        mlp_ratio = float(config.mlp_ratio)
+        slice_num = int(config.num_slices)
+        unified_pos = bool(getattr(config, "unified_pos", False))
         self.__name__ = 'LaMO'
         self.preprocess = MLP(fun_dim + space_dim, n_hidden * 2, n_hidden,
                               n_layers=0, res=False, act=act)
         self.n_hidden = n_hidden
         self.space_dim = space_dim
+        self.unified_pos = unified_pos
 
         self.blocks = nn.ModuleList([
             LaMOBlock(num_heads=n_head, hidden_dim=n_hidden,
@@ -430,24 +466,24 @@ class LaMOBlock_Structured_Mesh_2D(nn.Module):
             return fx
         
 class LaMO_Structured_Mesh_2D(nn.Module):
-    def __init__(self,
-                 space_dim=1,
-                 n_layers=5,
-                 n_hidden=256,
-                 dropout=0.0,
-                 n_head=8,
-                 Time_Input=False,
-                 act='gelu',
-                 mlp_ratio=1,
-                 fun_dim=1,
-                 out_dim=1,
-                 slice_num=32,
-                 ref=8,
-                 unified_pos=False,
-                 H=85,
-                 W=85,
-                 ):
+    def __init__(self, config: LaMOConfig, metadata=None):
         super(LaMO_Structured_Mesh_2D, self).__init__()
+        metadata = {} if metadata is None else dict(metadata)
+        space_dim = int(metadata.get("space_dim", metadata.get("c_in", 1)))
+        fun_dim = int(metadata.get("fun_dim", 1))
+        out_dim = int(metadata.get("c_out", 1))
+        n_layers = int(config.num_blocks)
+        n_hidden = int(config.channel_dim)
+        dropout = float(getattr(config, "dropout", 0.0))
+        n_head = int(config.num_heads)
+        Time_Input = bool(getattr(config, "time_input", metadata.get("dataset") == "plasticity"))
+        act = "gelu" if getattr(config, "act", None) is None else config.act
+        mlp_ratio = float(config.mlp_ratio)
+        slice_num = int(config.num_slices)
+        ref = int(getattr(config, "ref", 8))
+        unified_pos = bool(config.unified_pos)
+        H = int(metadata.get("H", 85))
+        W = int(metadata.get("W", 85))
         self.__name__ = 'LaMO_2D'
         self.H = H
         self.W = W

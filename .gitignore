@@ -224,3 +224,9 @@ manuscript/_minted*
 manuscript/iclr*
 manuscript/natbib.sty
 fancyhdr.sty
+
+# Git worktrees
+.worktrees/
+
+# Experiment results (sweep exports, benchmark tables) are kept private
+*.csv

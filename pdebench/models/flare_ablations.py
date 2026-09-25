@@ -4,10 +4,30 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from einops import rearrange
+from dataclasses import dataclass
+from typing import Optional
 
 __all__ = [
     "BigFLAREModel",
 ]
+
+@dataclass
+class FlareAblationsConfig:
+    model: str = "flare_ablations"
+    channel_dim: int = 64
+    num_blocks: int = 8
+    num_latents: int = 64
+    num_heads: int = 8
+    act: Optional[str] = None
+    num_layers_kv_proj: int = 3
+    num_layers_ffn: int = 3
+    num_layers_in_out_proj: int = 2
+    mlp_ratio: float = 1.0
+    kv_proj_mlp_ratio: float = 1.0
+    in_out_proj_ratio: float = 1.0
+    out_proj_norm: bool = True
+    shared_att: bool = False
+    num_passes: int = 1
 
 from .flare import ResidualMLP
 from lra.models.backends import SelfAttentionBlock
@@ -222,29 +242,25 @@ class FinalLayer(nn.Module):
 # MODEL
 #======================================================================#
 class BigFLAREModel(nn.Module):
-    def __init__(self,
-        in_dim: int,
-        out_dim: int,
-        channel_dim: int = 64,
-        num_blocks: int = 8,
-        num_latents: int = None,
-        num_heads: int = None,
-        act: str = None,
-        #
-        num_layers_kv_proj: int = 3,
-        num_layers_mlp: int = 3,
-        num_layers_in_out_proj: int = 2,
-        #
-        mlp_ratio: float = 1.0,
-        kv_proj_ratio: float = 1.0,
-        in_out_proj_ratio: float = 1.0,
-        #
-        out_proj_ln: bool = True,
-        # ablation parameters
-        shared_latents: bool = False,
-        num_latent_blocks: int = 0,
-    ):
+    def __init__(self, config: FlareAblationsConfig, metadata=None):
         super().__init__()
+        metadata = {} if metadata is None else dict(metadata)
+        in_dim = int(metadata.get("c_in", metadata.get("point_input_dim", 1)))
+        out_dim = int(metadata.get("c_out", 1))
+        channel_dim = int(config.channel_dim)
+        num_blocks = int(config.num_blocks)
+        num_latents = int(config.num_latents)
+        num_heads = int(config.num_heads)
+        act = "gelu" if config.act is None else config.act
+        num_layers_kv_proj = int(config.num_layers_kv_proj)
+        num_layers_mlp = int(config.num_layers_ffn)
+        num_layers_in_out_proj = int(config.num_layers_in_out_proj)
+        mlp_ratio = float(config.mlp_ratio)
+        kv_proj_ratio = float(config.kv_proj_mlp_ratio)
+        in_out_proj_ratio = float(config.in_out_proj_ratio)
+        out_proj_ln = bool(config.out_proj_norm)
+        shared_latents = bool(config.shared_att)
+        num_latent_blocks = int(config.num_passes)
 
         mlp_hidden_dim = int(channel_dim * mlp_ratio)
         kv_proj_hidden_dim = int(channel_dim * kv_proj_ratio)

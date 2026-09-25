@@ -54,7 +54,7 @@ class Callback(mlutils.Callback):
 
         return
     
-    def evaluate(self, trainer: mlutils.Trainer, ckpt_dir: str):
+    def evaluate(self, trainer: mlutils.Trainer, ckpt_dir: str, stat_vals: dict | None = None):
         self.modify_dataset_transform(trainer, True)
         self._evaluate(trainer, ckpt_dir)
         self.modify_dataset_transform(trainer, False)
@@ -69,6 +69,25 @@ class Callback(mlutils.Callback):
 
 #======================================================================#
 class FinaltimeCallback(Callback):
+    def evaluate(self, trainer: mlutils.Trainer, ckpt_dir: str, stat_vals: dict | None = None):
+        # LPBF trains with physical Rel-L2; FinaltimeCallback itself reports MSE/R2
+        # for visualization only. Mirror RelL2Callback's artifact so ablation
+        # plotters can read ``rel_error.json`` without a stats.json fallback.
+        if trainer.GLOBAL_RANK == 0 and stat_vals:
+            train_rel = stat_vals.get("train_loss")
+            test_rel = stat_vals.get("test_loss")
+            if train_rel is not None and test_rel is not None:
+                print(f"Relative Error (train / test): {train_rel:.8e} / {test_rel:.8e}")
+                payload = {
+                    "train_rel_error": float(train_rel),
+                    "test_rel_error": float(test_rel),
+                }
+                with open(os.path.join(ckpt_dir, "rel_error.json"), "w") as f:
+                    json.dump(payload, f)
+                with open(os.path.join(ckpt_dir, "..", "rel_error.json"), "w") as f:
+                    json.dump(payload, f)
+        return super().evaluate(trainer, ckpt_dir, stat_vals)
+
     def _evaluate(self, trainer: mlutils.Trainer, ckpt_dir: str):
 
         device = trainer.device
